@@ -4,6 +4,10 @@ A small Windows graphing calculator written in C. It uses the Win32 API directly
 
 Note: This project is just me playing around with OpenAI Codex.
 
+## Download
+
+Download the latest Windows build: [graphcalc.exe](https://github.com/echiubc/local-graphing-calculator/raw/main/graphcalc.exe)
+
 ## Features
 
 - Type a function of `x` and draw it locally.
