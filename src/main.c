@@ -318,6 +318,13 @@ static bool number_can_start(char c) {
     return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-';
 }
 
+static bool implicit_factor_can_start(Parser *p) {
+    skip_spaces(p);
+    char c = p->text[p->pos];
+    return c == '(' || c == '.' || (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
 static bool parse_fraction_tail(Parser *p, double numerator, double *value) {
     size_t slash_pos = p->pos;
     skip_spaces(p);
@@ -482,6 +489,7 @@ static double parse_term(Parser *p) {
     for (;;) {
         if (match_char(p, '*')) value *= parse_power(p);
         else if (match_char(p, '/')) value /= parse_power(p);
+        else if (implicit_factor_can_start(p)) value *= parse_power(p);
         else break;
     }
     return value;
@@ -727,6 +735,19 @@ static void reuse_selected_calculation_result(void) {
     wchar_t result[80];
     MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[selected].result, -1, result, (int)(sizeof(result) / sizeof(result[0])));
     append_to_input(result);
+}
+
+static void delete_selected_calculation(HWND hwnd) {
+    int selected = (int)SendMessageW(g_app.scientific_history, LB_GETCURSEL, 0, 0);
+    if (selected < 0 || selected >= g_app.calculation_count) return;
+
+    for (int i = selected; i < g_app.calculation_count - 1; i++) {
+        g_app.calculations[i] = g_app.calculations[i + 1];
+    }
+    g_app.calculation_count--;
+    refresh_calculation_history();
+    update_status();
+    InvalidateRect(hwnd, NULL, TRUE);
 }
 
 static void set_input_from_graph(int index) {
@@ -1311,10 +1332,10 @@ static void layout_controls(HWND hwnd) {
 
     int margin = 20;
     int sidebar_w = 268;
-    int input_h = 32;
+    int input_h = 34;
     int button_h = 30;
-    int gap = 8;
-    int y = margin + 54;
+    int gap = 10;
+    int y = margin + 62;
 
     MoveWindow(g_app.input, margin, y, sidebar_w, input_h, TRUE);
     y += input_h + gap;
@@ -1341,12 +1362,12 @@ static void layout_controls(HWND hwnd) {
     if (g_app.scientific_mode) {
         MoveWindow(g_app.scientific_calc_button, margin, y, sidebar_w, button_h, TRUE);
         y += button_h + gap;
-        MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 48, TRUE);
-        y += 48 + gap;
+        MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 50, TRUE);
+        y += 50 + gap;
         MoveWindow(g_app.scientific_output_toggle, margin, y, sidebar_w, button_h, TRUE);
-        y += button_h + gap + 20;
-        MoveWindow(g_app.scientific_history, margin, y, sidebar_w, 158, TRUE);
-        y += 158 + 18;
+        y += button_h + gap + 24;
+        MoveWindow(g_app.scientific_history, margin, y, sidebar_w, 148, TRUE);
+        y += 148 + 20;
     } else {
     int half = (sidebar_w - gap) / 2;
     MoveWindow(g_app.add_button, margin, y, half, button_h, TRUE);
@@ -1356,8 +1377,8 @@ static void layout_controls(HWND hwnd) {
     MoveWindow(g_app.color_button, margin + half + gap, y, half, button_h, TRUE);
     y += button_h + gap;
 
-    MoveWindow(g_app.list, margin, y, sidebar_w, 156, TRUE);
-    y += 156 + gap;
+    MoveWindow(g_app.list, margin, y, sidebar_w, 146, TRUE);
+    y += 146 + 12;
 
     int third = (sidebar_w - gap * 2) / 3;
     MoveWindow(g_app.zoom_out_button, margin, y, third, button_h, TRUE);
@@ -1367,7 +1388,7 @@ static void layout_controls(HWND hwnd) {
     }
 
     int cols = 5;
-    int pad_gap = 6;
+    int pad_gap = 7;
     int pad_w = (sidebar_w - pad_gap * (cols - 1)) / cols;
     int pad_h = 30;
     for (int i = 0; i < g_app.pad_count; i++) {
@@ -1524,14 +1545,14 @@ static void draw_sidebar(HDC hdc, RECT client) {
     TextOutW(hdc, 24, 48, g_app.scientific_mode ? L"Scientific workspace" : L"Graphing workspace",
         g_app.scientific_mode ? 20 : 18);
 
-    RECT input_panel = {18, 64, 294, g_app.scientific_mode ? 398 : 412};
+    RECT input_panel = {18, 72, 294, g_app.scientific_mode ? 412 : 422};
     fill_round_rect(hdc, input_panel, 14, g_app.dark_mode ? RGB(18, 25, 38) : RGB(250, 252, 255), c.panel_border);
 
-    TextOutW(hdc, 24, g_app.scientific_mode ? 426 : 440, L"Keys", 4);
+    TextOutW(hdc, 24, g_app.scientific_mode ? 440 : 450, L"Keys", 4);
     if (g_app.scientific_mode) {
-        TextOutW(hdc, 24, 220, L"History", 7);
+        TextOutW(hdc, 24, 238, L"History", 7);
     } else {
-        TextOutW(hdc, 24, 184, L"Graphs", 6);
+        TextOutW(hdc, 24, 192, L"Graphs", 6);
     }
     SelectObject(hdc, old_font);
 }
@@ -1574,7 +1595,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
         g_app.graph_mode_button = create_button(hwnd, L"Graphing", MODE_GRAPH_ID);
         g_app.scientific_mode_button = create_button(hwnd, L"Scientific", MODE_SCI_ID);
-        g_app.input = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"sin(x)",
+        g_app.input = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)INPUT_ID, GetModuleHandleW(NULL), NULL);
         g_app.add_button = create_button(hwnd, L"Add graph", ADD_ID);
@@ -1603,7 +1624,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
         apply_control_fonts();
         update_scientific_output_toggle_text();
-        add_graph_from_input(hwnd);
+        refresh_graph_list();
         layout_controls(hwnd);
         update_status();
         return 0;
@@ -1729,6 +1750,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_KEYDOWN:
         switch (wparam) {
+        case VK_DELETE:
+            if (g_app.scientific_mode) {
+                delete_selected_calculation(hwnd);
+            } else {
+                remove_selected_graph(hwnd);
+            }
+            return 0;
         case VK_RETURN:
             if (g_app.scientific_mode) {
                 calculate_scientific_result();
