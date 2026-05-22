@@ -22,7 +22,7 @@
 
 #define APP_CLASS_NAME L"LocalGraphingCalculatorWindow"
 #define MAX_GRAPHS 32
-#define MAX_PAD_BUTTONS 35
+#define MAX_PAD_BUTTONS 40
 
 #define INPUT_ID 1001
 #define ADD_ID 1002
@@ -116,6 +116,7 @@ typedef struct {
     HBRUSH control_bg_brush;
     Graph graphs[MAX_GRAPHS];
     Calculation calculations[128];
+    double variables[26];
     int graph_count;
     int selected_graph;
     int calculation_count;
@@ -128,6 +129,7 @@ typedef struct {
     bool dark_mode;
     bool scientific_mode;
     bool scientific_fraction_output;
+    bool has_variable[26];
     bool has_answer;
     bool has_error;
     char error[160];
@@ -452,6 +454,15 @@ static double parse_primary(Parser *p) {
             return NAN;
         }
         memcpy(name, p->text + start, len);
+
+        if (len == 1) {
+            int index = ascii_lower((unsigned char)name[0]) - 'a';
+            if (index >= 0 && index < 26 && index != ('x' - 'a')) {
+                if (g_app.has_variable[index]) return g_app.variables[index];
+                set_error(p, "Variable has not been assigned.");
+                return NAN;
+            }
+        }
 
         if (!match_char(p, '(')) {
             set_error(p, "Expected '(' after function name.");
@@ -783,13 +794,54 @@ static void update_status(void) {
     set_status_text(text);
 }
 
+static bool parse_variable_assignment(const char *expr, char *name, const char **rhs) {
+    const char *p = expr;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) return false;
+
+    char variable = (char)ascii_lower((unsigned char)*p);
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '=') return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (variable == 'x') {
+        g_app.has_error = true;
+        strcpy(g_app.error, "x is reserved for graphing.");
+        return true;
+    }
+    if (*p == '\0') {
+        g_app.has_error = true;
+        strcpy(g_app.error, "Expected a value after '='.");
+        return true;
+    }
+
+    *name = variable;
+    *rhs = p;
+    return true;
+}
+
 static void calculate_scientific_result(void) {
     char expr[512];
     char error[160] = {0};
     char stored_result[64] = {0};
+    char variable = '\0';
+    const char *expression_to_evaluate = expr;
     read_input_expression(expr, sizeof(expr));
+    g_app.has_error = false;
+    g_app.error[0] = '\0';
 
-    double result = evaluate_expression(expr, 0.0, error, sizeof(error));
+    bool is_assignment = parse_variable_assignment(expr, &variable, &expression_to_evaluate);
+    if (g_app.has_error) {
+        wchar_t text[256];
+        MultiByteToWideChar(CP_UTF8, 0, g_app.error, -1, text, (int)(sizeof(text) / sizeof(text[0])));
+        SetWindowTextW(g_app.scientific_result, text);
+        update_status();
+        return;
+    }
+
+    double result = evaluate_expression(expression_to_evaluate, 0.0, error, sizeof(error));
     if (error[0] != '\0' || !isfinite(result)) {
         if (error[0] == '\0') strcpy(error, "Result is undefined.");
         wchar_t text[256];
@@ -803,6 +855,11 @@ static void calculate_scientific_result(void) {
         snprintf(stored_result, sizeof(stored_result), "%.17g", result);
         g_app.last_answer = result;
         g_app.has_answer = true;
+        if (is_assignment) {
+            int index = variable - 'a';
+            g_app.variables[index] = result;
+            g_app.has_variable[index] = true;
+        }
         g_app.has_error = false;
         g_app.error[0] = '\0';
         update_scientific_result_display();
@@ -1415,7 +1472,8 @@ static void create_keypad(HWND hwnd) {
         L"0", L".", L"x", L"+", L"sqrt(",
         L"(", L")", L"^", L"pi", L"log(",
         L"ln(", L"abs(", L"exp(", L"e", L"ans",
-        L"floor(", L"ceil(", L"asin(", L"acos(", L"Clear"
+        L"floor(", L"ceil(", L"asin(", L"acos(", L"Clear",
+        L"a", L"b", L"c", L"d", L"="
     };
 
     g_app.pad_count = (int)(sizeof(labels) / sizeof(labels[0]));
@@ -1568,7 +1626,7 @@ static void draw_scientific_workspace(HDC hdc, RECT client) {
     TextOutW(hdc, panel.left + 28, panel.top + 26, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
     const wchar_t *help = L"Type an expression, decimal, fraction, or mixed number, then press Calculate or Enter.";
-    const wchar_t *functions = L"Settings can show scientific results as decimals or fractions; ans keeps full precision.";
+    const wchar_t *functions = L"Use a = 5 to store variables; ans keeps full precision for follow-up calculations.";
     TextOutW(hdc, panel.left + 28, panel.top + 60, help, lstrlenW(help));
     TextOutW(hdc, panel.left + 28, panel.top + 92, functions, lstrlenW(functions));
     SelectObject(hdc, old_font);
