@@ -654,6 +654,7 @@ static void set_input_from_graph(int index);
 static void refresh_calculation_history(void);
 static void layout_controls(HWND hwnd);
 static void update_status(void);
+static void auto_fit_graph(HWND hwnd, int graph_index);
 FILE *_wfopen(const wchar_t *filename, const wchar_t *mode);
 
 static long long gcd_ll(long long a, long long b) {
@@ -1044,6 +1045,7 @@ static void add_graph_from_input(HWND hwnd) {
 
     refresh_graph_list();
     validate_graphs();
+    auto_fit_graph(hwnd, g_app.selected_graph);
     update_status();
     InvalidateRect(hwnd, NULL, TRUE);
 }
@@ -1062,6 +1064,7 @@ static void update_selected_graph(HWND hwnd) {
 
     refresh_graph_list();
     validate_graphs();
+    auto_fit_graph(hwnd, g_app.selected_graph);
     update_status();
     InvalidateRect(hwnd, NULL, TRUE);
 }
@@ -1221,6 +1224,165 @@ static void invalidate_plot(HWND hwnd) {
     RECT plot = plot_rect(hwnd);
     InflateRect(&plot, 2, 2);
     InvalidateRect(hwnd, &plot, FALSE);
+}
+
+static void fit_bounds_to_plot(HWND hwnd, double min_x, double max_x, double min_y, double max_y) {
+    if (!isfinite(min_x) || !isfinite(max_x) || !isfinite(min_y) || !isfinite(max_y)) return;
+    if (max_x <= min_x || max_y <= min_y) return;
+
+    RECT plot = plot_rect(hwnd);
+    double width = max_x - min_x;
+    double height = max_y - min_y;
+    double padded_width = width * 1.15;
+    double padded_height = height * 1.15;
+    if (padded_width <= 0.0 || padded_height <= 0.0) return;
+
+    double scale_x = (plot.right - plot.left) / padded_width;
+    double scale_y = (plot.bottom - plot.top) / padded_height;
+    double new_scale = fmin(scale_x, scale_y);
+    if (!isfinite(new_scale) || new_scale <= 1.0) return;
+
+    g_app.center_x = (min_x + max_x) * 0.5;
+    g_app.center_y = (min_y + max_y) * 0.5;
+    g_app.scale = new_scale;
+}
+
+static void auto_fit_function_graph(HWND hwnd, Graph *graph) {
+    RECT plot = plot_rect(hwnd);
+    double left = screen_to_world_x(plot.left, plot);
+    double right = screen_to_world_x(plot.right, plot);
+    double min_y = 0.0;
+    double max_y = 0.0;
+    bool has_point = false;
+    char error[160] = {0};
+
+    for (int i = 0; i <= 160; i++) {
+        double x = left + (right - left) * i / 160.0;
+        double y = evaluate_graph_value(graph->expression, x, 0.0, error, sizeof(error));
+        if (error[0] != '\0' || !isfinite(y)) continue;
+        if (!has_point) {
+            min_y = max_y = y;
+            has_point = true;
+        } else {
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+    }
+
+    if (!has_point) return;
+    double visible_bottom = screen_to_world_y(plot.bottom, plot);
+    double visible_top = screen_to_world_y(plot.top, plot);
+    if (min_y >= visible_bottom && max_y <= visible_top) return;
+
+    if (fabs(max_y - min_y) < 1e-9) {
+        min_y -= 1.0;
+        max_y += 1.0;
+    }
+    fit_bounds_to_plot(hwnd, left, right, min_y, max_y);
+}
+
+static bool implicit_crosses_cell(double f00, double f10, double f01, double f11) {
+    return (f00 <= 0.0 && f10 >= 0.0) || (f00 >= 0.0 && f10 <= 0.0) ||
+           (f10 <= 0.0 && f11 >= 0.0) || (f10 >= 0.0 && f11 <= 0.0) ||
+           (f11 <= 0.0 && f01 >= 0.0) || (f11 >= 0.0 && f01 <= 0.0) ||
+           (f01 <= 0.0 && f00 >= 0.0) || (f01 >= 0.0 && f00 <= 0.0);
+}
+
+static bool find_implicit_bounds(Graph *graph, double span, double *min_x, double *max_x, double *min_y, double *max_y) {
+    const int samples = 90;
+    char error[160] = {0};
+    bool found = false;
+
+    for (int ix = 0; ix < samples; ix++) {
+        double x1 = -span + 2.0 * span * ix / samples;
+        double x2 = -span + 2.0 * span * (ix + 1) / samples;
+        for (int iy = 0; iy < samples; iy++) {
+            double y1 = -span + 2.0 * span * iy / samples;
+            double y2 = -span + 2.0 * span * (iy + 1) / samples;
+            double f00 = evaluate_implicit_equation(graph->expression, x1, y1, error, sizeof(error));
+            double f10 = evaluate_implicit_equation(graph->expression, x2, y1, error, sizeof(error));
+            double f01 = evaluate_implicit_equation(graph->expression, x1, y2, error, sizeof(error));
+            double f11 = evaluate_implicit_equation(graph->expression, x2, y2, error, sizeof(error));
+            if (error[0] != '\0' || !isfinite(f00) || !isfinite(f10) || !isfinite(f01) || !isfinite(f11)) continue;
+            if (!implicit_crosses_cell(f00, f10, f01, f11)) continue;
+
+            if (!found) {
+                *min_x = x1;
+                *max_x = x2;
+                *min_y = y1;
+                *max_y = y2;
+                found = true;
+            } else {
+                if (x1 < *min_x) *min_x = x1;
+                if (x2 > *max_x) *max_x = x2;
+                if (y1 < *min_y) *min_y = y1;
+                if (y2 > *max_y) *max_y = y2;
+            }
+        }
+    }
+    return found;
+}
+
+static void auto_fit_implicit_graph(HWND hwnd, Graph *graph) {
+    RECT plot = plot_rect(hwnd);
+    double current_span_x = (plot.right - plot.left) / (2.0 * g_app.scale);
+    double current_span_y = (plot.bottom - plot.top) / (2.0 * g_app.scale);
+    double span = fmax(fmax(current_span_x, current_span_y), 5.0);
+
+    for (int attempt = 0; attempt < 6; attempt++) {
+        double min_x = 0.0, max_x = 0.0, min_y = 0.0, max_y = 0.0;
+        if (find_implicit_bounds(graph, span, &min_x, &max_x, &min_y, &max_y)) {
+            double visible_left = screen_to_world_x(plot.left, plot);
+            double visible_right = screen_to_world_x(plot.right, plot);
+            double visible_bottom = screen_to_world_y(plot.bottom, plot);
+            double visible_top = screen_to_world_y(plot.top, plot);
+            if (min_x >= visible_left && max_x <= visible_right && min_y >= visible_bottom && max_y <= visible_top) return;
+            fit_bounds_to_plot(hwnd, min_x, max_x, min_y, max_y);
+            return;
+        }
+        span *= 2.0;
+    }
+}
+
+static void auto_fit_surface_graph(HWND hwnd, Graph *graph) {
+    RECT plot = plot_rect(hwnd);
+    char error[160] = {0};
+    double max_extent = 5.0;
+    const double domain = 5.0;
+
+    for (int ix = 0; ix <= 24; ix++) {
+        double x = -domain + 2.0 * domain * ix / 24.0;
+        for (int iy = 0; iy <= 24; iy++) {
+            double y = -domain + 2.0 * domain * iy / 24.0;
+            double z = evaluate_graph_value(graph->expression, x, y, error, sizeof(error));
+            if (error[0] != '\0' || !isfinite(z)) continue;
+            double extent = fmax(fmax(fabs(x), fabs(y)), fabs(z));
+            if (extent > max_extent) max_extent = extent;
+        }
+    }
+
+    double scale_x = (plot.right - plot.left) / (2.6 * max_extent);
+    double scale_y = (plot.bottom - plot.top) / (2.6 * max_extent);
+    double new_scale = fmin(scale_x, scale_y);
+    if (isfinite(new_scale) && new_scale > 1.0 && new_scale < g_app.scale) {
+        g_app.scale = new_scale;
+    }
+}
+
+static void auto_fit_graph(HWND hwnd, int graph_index) {
+    if (graph_index < 0 || graph_index >= g_app.graph_count) return;
+    Graph *graph = &g_app.graphs[graph_index];
+    switch (graph_kind(graph)) {
+    case GRAPH_FUNCTION_2D:
+        auto_fit_function_graph(hwnd, graph);
+        break;
+    case GRAPH_IMPLICIT_2D:
+        auto_fit_implicit_graph(hwnd, graph);
+        break;
+    case GRAPH_SURFACE_3D:
+        auto_fit_surface_graph(hwnd, graph);
+        break;
+    }
 }
 
 static void draw_grid(HDC hdc, RECT plot) {
