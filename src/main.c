@@ -682,6 +682,22 @@ static double nice_grid_step(double pixels_per_unit) {
     return 10.0 * base;
 }
 
+static void format_grid_label(double value, double step, char *out, size_t out_size) {
+    if (fabs(value) < fabs(step) * 1e-8) value = 0.0;
+
+    double abs_step = fabs(step);
+    if (abs_step >= 1000.0 || (abs_step > 0.0 && abs_step < 0.001)) {
+        snprintf(out, out_size, "%.3g", value);
+    } else if (abs_step >= 1.0) {
+        snprintf(out, out_size, "%.0f", value);
+    } else {
+        int decimals = (int)ceil(-log10(abs_step)) + 1;
+        if (decimals < 1) decimals = 1;
+        if (decimals > 6) decimals = 6;
+        snprintf(out, out_size, "%.*f", decimals, value);
+    }
+}
+
 static void draw_text_utf8(HDC hdc, int x, int y, const char *text) {
     wchar_t wide[256];
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, (int)(sizeof(wide) / sizeof(wide[0])));
@@ -1135,6 +1151,46 @@ static void draw_grid(HDC hdc, RECT plot) {
     if (y_axis >= plot.left && y_axis <= plot.right) {
         MoveToEx(hdc, y_axis, plot.top, NULL);
         LineTo(hdc, y_axis, plot.bottom);
+    }
+
+    int label_x_axis = x_axis >= plot.top && x_axis <= plot.bottom ? x_axis : plot.bottom - 22;
+    int label_y_axis = y_axis >= plot.left && y_axis <= plot.right ? y_axis : plot.left + 10;
+    char grid_label[64];
+
+    for (double x = floor(left / step) * step; x <= right; x += step) {
+        if (fabs(x) < fabs(step) * 1e-8) continue;
+        int sx = world_to_screen_x(x, plot);
+        format_grid_label(x, step, grid_label, sizeof(grid_label));
+
+        SIZE text_size = {0};
+        wchar_t wide[64];
+        MultiByteToWideChar(CP_UTF8, 0, grid_label, -1, wide, (int)(sizeof(wide) / sizeof(wide[0])));
+        GetTextExtentPoint32W(hdc, wide, (int)wcslen(wide), &text_size);
+
+        int tx = sx - text_size.cx / 2;
+        int ty = label_x_axis + 5;
+        if (ty + text_size.cy > plot.bottom - 4) ty = label_x_axis - text_size.cy - 5;
+        if (tx < plot.left + 4) tx = plot.left + 4;
+        if (tx + text_size.cx > plot.right - 4) tx = plot.right - text_size.cx - 4;
+        draw_text_utf8(hdc, tx, ty, grid_label);
+    }
+
+    for (double y = floor(bottom / step) * step; y <= top; y += step) {
+        if (fabs(y) < fabs(step) * 1e-8) continue;
+        int sy = world_to_screen_y(y, plot);
+        format_grid_label(y, step, grid_label, sizeof(grid_label));
+
+        SIZE text_size = {0};
+        wchar_t wide[64];
+        MultiByteToWideChar(CP_UTF8, 0, grid_label, -1, wide, (int)(sizeof(wide) / sizeof(wide[0])));
+        GetTextExtentPoint32W(hdc, wide, (int)wcslen(wide), &text_size);
+
+        int tx = label_y_axis + 6;
+        if (tx + text_size.cx > plot.right - 4) tx = label_y_axis - text_size.cx - 6;
+        int ty = sy - text_size.cy / 2;
+        if (ty < plot.top + 4) ty = plot.top + 4;
+        if (ty + text_size.cy > plot.bottom - 4) ty = plot.bottom - text_size.cy - 4;
+        draw_text_utf8(hdc, tx, ty, grid_label);
     }
 
     char label[160];
