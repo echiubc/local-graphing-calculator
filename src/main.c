@@ -36,7 +36,6 @@
 #define RESET_ID 1010
 #define MODE_GRAPH_ID 1011
 #define MODE_SCI_ID 1012
-#define MODE_3D_ID 1019
 #define SCI_CALC_ID 1013
 #define SCI_RESULT_ID 1014
 #define SAVE_GRAPHS_ID 1015
@@ -70,17 +69,9 @@ typedef struct {
     const char *text;
     size_t pos;
     double x;
-    double y;
     bool degrees;
-    bool graph_vars;
     char error[128];
 } Parser;
-
-typedef enum {
-    GRAPH_FUNCTION_2D,
-    GRAPH_IMPLICIT_2D,
-    GRAPH_SURFACE_3D
-} GraphKind;
 
 typedef struct {
     char expression[512];
@@ -134,19 +125,14 @@ typedef struct {
     double center_x;
     double center_y;
     double scale;
-    double rotation_x;
-    double rotation_z;
     bool degrees;
     bool dark_mode;
     bool scientific_mode;
-    bool graph3d_mode;
     bool scientific_fraction_output;
     bool has_variable[52];
     bool has_answer;
     bool has_error;
-    bool dragging_3d;
     char error[160];
-    POINT last_mouse;
     bool hover_valid;
     bool hover_snap;
     POINT hover_screen;
@@ -450,8 +436,7 @@ static double parse_primary(Parser *p) {
         return value;
     }
 
-    if (p->graph_vars && match_word(p, "x")) return p->x;
-    if (p->graph_vars && match_word(p, "y")) return p->y;
+    if (match_word(p, "x")) return p->x;
     if (match_word(p, "ans")) {
         if (g_app.has_answer) return g_app.last_answer;
         set_error(p, "No previous answer is saved yet.");
@@ -537,8 +522,8 @@ static double parse_expression(Parser *p) {
     return value;
 }
 
-static double evaluate_expression_xy(const char *text, double x, double y, bool graph_vars, char *error, size_t error_size) {
-    Parser p = { text, 0, x, y, g_app.degrees, graph_vars, {0} };
+static double evaluate_expression(const char *text, double x, char *error, size_t error_size) {
+    Parser p = { text, 0, x, g_app.degrees, {0} };
     double value = parse_expression(&p);
     skip_spaces(&p);
     if (p.error[0] == '\0' && p.text[p.pos] != '\0') set_error(&p, "Unexpected text after expression.");
@@ -551,91 +536,6 @@ static double evaluate_expression_xy(const char *text, double x, double y, bool 
 
     error[0] = '\0';
     return value;
-}
-
-static double evaluate_expression(const char *text, double x, char *error, size_t error_size) {
-    return evaluate_expression_xy(text, x, 0.0, false, error, error_size);
-}
-
-static bool expression_has_lower_y(const char *text) {
-    for (size_t i = 0; text[i] != '\0'; i++) {
-        if (text[i] == 'y' && (i == 0 || !((text[i - 1] >= 'a' && text[i - 1] <= 'z') || (text[i - 1] >= 'A' && text[i - 1] <= 'Z')))) {
-            char next = text[i + 1];
-            if (!((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_')) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static const char *find_equation_equals(const char *text) {
-    return strchr(text, '=');
-}
-
-static const char *surface_rhs(const char *text) {
-    while (*text == ' ' || *text == '\t') text++;
-    if ((*text == 'z' || *text == 'Z')) {
-        const char *p = text + 1;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '=') {
-            p++;
-            while (*p == ' ' || *p == '\t') p++;
-            return p;
-        }
-    }
-    return NULL;
-}
-
-static GraphKind graph_kind(const Graph *graph) {
-    if (surface_rhs(graph->expression)) return GRAPH_SURFACE_3D;
-    if (find_equation_equals(graph->expression)) return GRAPH_IMPLICIT_2D;
-    if (expression_has_lower_y(graph->expression)) return GRAPH_SURFACE_3D;
-    return GRAPH_FUNCTION_2D;
-}
-
-static bool has_surface_graph(void) {
-    for (int i = 0; i < g_app.graph_count; i++) {
-        if (g_app.graphs[i].visible && graph_kind(&g_app.graphs[i]) == GRAPH_SURFACE_3D) return true;
-    }
-    return false;
-}
-
-static double evaluate_graph_value(const char *expr, double x, double y, char *error, size_t error_size) {
-    const char *rhs = surface_rhs(expr);
-    if (rhs) expr = rhs;
-    return evaluate_expression_xy(expr, x, y, true, error, error_size);
-}
-
-static double evaluate_implicit_equation(const char *expr, double x, double y, char *error, size_t error_size) {
-    const char *equals = find_equation_equals(expr);
-    if (!equals) return evaluate_graph_value(expr, x, y, error, error_size);
-
-    char left[512];
-    char right[512];
-    size_t left_len = (size_t)(equals - expr);
-    if (left_len >= sizeof(left)) left_len = sizeof(left) - 1;
-    memcpy(left, expr, left_len);
-    left[left_len] = '\0';
-    strncpy(right, equals + 1, sizeof(right) - 1);
-    right[sizeof(right) - 1] = '\0';
-
-    char left_error[160] = {0};
-    char right_error[160] = {0};
-    double left_value = evaluate_graph_value(left, x, y, left_error, sizeof(left_error));
-    double right_value = evaluate_graph_value(right, x, y, right_error, sizeof(right_error));
-    if (left_error[0] != '\0') {
-        strncpy(error, left_error, error_size - 1);
-        error[error_size - 1] = '\0';
-        return NAN;
-    }
-    if (right_error[0] != '\0') {
-        strncpy(error, right_error, error_size - 1);
-        error[error_size - 1] = '\0';
-        return NAN;
-    }
-    error[0] = '\0';
-    return left_value - right_value;
 }
 
 static int world_to_screen_x(double x, RECT plot) {
@@ -738,9 +638,8 @@ static void update_scientific_output_toggle_text(void) {
         g_app.scientific_fraction_output ? L"Show decimal" : L"Show fraction");
 }
 
-static void set_calculator_mode(HWND hwnd, bool scientific_mode, bool graph3d_mode) {
+static void set_calculator_mode(HWND hwnd, bool scientific_mode) {
     g_app.scientific_mode = scientific_mode;
-    g_app.graph3d_mode = graph3d_mode;
     g_app.hover_valid = false;
     g_app.has_error = false;
     g_app.error[0] = '\0';
@@ -806,12 +705,8 @@ static void draw_text_utf8(HDC hdc, int x, int y, const char *text) {
 
 static void graph_list_label(int index, wchar_t *out, size_t out_len) {
     wchar_t expr[512];
-    const wchar_t *kind = L"y";
-    GraphKind graph_type = graph_kind(&g_app.graphs[index]);
-    if (graph_type == GRAPH_IMPLICIT_2D) kind = L"eq";
-    else if (graph_type == GRAPH_SURFACE_3D) kind = L"3D";
     MultiByteToWideChar(CP_UTF8, 0, g_app.graphs[index].expression, -1, expr, (int)(sizeof(expr) / sizeof(expr[0])));
-    _snwprintf(out, out_len, L"%d  [%ls] %ls", index + 1, kind, expr);
+    _snwprintf(out, out_len, L"%d  %ls", index + 1, expr);
     out[out_len - 1] = L'\0';
 }
 
@@ -910,11 +805,11 @@ static void update_status(void) {
         MultiByteToWideChar(CP_UTF8, 0, g_app.hover_label, -1, text, (int)(sizeof(text) / sizeof(text[0])));
     } else {
         _snwprintf(text, sizeof(text) / sizeof(text[0]), L"%ls calculator    %ls angle    %ls theme%ls%ls",
-            g_app.scientific_mode ? L"Scientific" : (g_app.graph3d_mode ? L"3D graphing" : L"Graphing"),
+            g_app.scientific_mode ? L"Scientific" : L"Graphing",
             g_app.degrees ? L"DEG" : L"RAD",
             g_app.dark_mode ? L"Dark" : L"Light",
             g_app.scientific_mode ? (g_app.scientific_fraction_output ? L"    Fraction output" : L"    Decimal output") : L"",
-            g_app.scientific_mode ? L"" : (g_app.graph3d_mode ? L"    Drag: rotate    Zoom: + / -" : L"    Pan: arrows    Zoom: + / -"));
+            g_app.scientific_mode ? L"" : L"    Pan: arrows    Zoom: + / -");
         text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
     }
     set_status_text(text);
@@ -999,11 +894,7 @@ static void validate_graphs(void) {
     g_app.error[0] = '\0';
     char error[160] = {0};
     for (int i = 0; i < g_app.graph_count; i++) {
-        if (graph_kind(&g_app.graphs[i]) == GRAPH_IMPLICIT_2D) {
-            evaluate_implicit_equation(g_app.graphs[i].expression, 0.0, 0.0, error, sizeof(error));
-        } else {
-            evaluate_graph_value(g_app.graphs[i].expression, 0.0, 0.0, error, sizeof(error));
-        }
+        evaluate_expression(g_app.graphs[i].expression, 0.0, error, sizeof(error));
         if (error[0] != '\0') {
             g_app.has_error = true;
             snprintf(g_app.error, sizeof(g_app.error), "Graph %d: %s", i + 1, error);
@@ -1206,8 +1097,6 @@ static void import_graphs(HWND hwnd) {
     g_app.center_y = center_y;
     if (scale > 1.0) g_app.scale = scale;
     g_app.degrees = degrees;
-    g_app.rotation_x = 0.8;
-    g_app.rotation_z = -0.7;
     g_app.next_color = next_distinct_default_color(g_app.graphs[g_app.graph_count - 1].color, g_app.graph_count);
     set_input_from_graph(g_app.selected_graph);
     refresh_graph_list();
@@ -1316,7 +1205,6 @@ static void draw_grid(HDC hdc, RECT plot) {
 static void draw_graph(HDC hdc, RECT plot, int graph_index) {
     Graph *graph = &g_app.graphs[graph_index];
     if (!graph->visible) return;
-    if (graph_kind(graph) != GRAPH_FUNCTION_2D) return;
 
     HPEN function_pen = CreatePen(PS_SOLID, graph_index == g_app.selected_graph ? 4 : 3, graph->color);
     HPEN old_pen = SelectObject(hdc, function_pen);
@@ -1325,7 +1213,7 @@ static void draw_graph(HDC hdc, RECT plot, int graph_index) {
 
     for (int sx = plot.left; sx <= plot.right; sx++) {
         double x = screen_to_world_x(sx, plot);
-        double y = evaluate_graph_value(graph->expression, x, 0.0, error, sizeof(error));
+        double y = evaluate_expression(graph->expression, x, error, sizeof(error));
 
         if (error[0] != '\0') {
             g_app.has_error = true;
@@ -1356,187 +1244,11 @@ static void draw_graph(HDC hdc, RECT plot, int graph_index) {
     DeleteObject(function_pen);
 }
 
-static void draw_implicit_graph(HDC hdc, RECT plot, int graph_index) {
-    Graph *graph = &g_app.graphs[graph_index];
-    if (!graph->visible || graph_kind(graph) != GRAPH_IMPLICIT_2D) return;
-
-    HPEN pen = CreatePen(PS_SOLID, graph_index == g_app.selected_graph ? 3 : 2, graph->color);
-    HPEN old_pen = SelectObject(hdc, pen);
-    char error[160] = {0};
-    const int cell = 5;
-
-    for (int sx = plot.left; sx < plot.right; sx += cell) {
-        for (int sy = plot.top; sy < plot.bottom; sy += cell) {
-            double x1 = screen_to_world_x(sx, plot);
-            double y1 = screen_to_world_y(sy, plot);
-            double x2 = screen_to_world_x(sx + cell, plot);
-            double y2 = screen_to_world_y(sy + cell, plot);
-
-            double f00 = evaluate_implicit_equation(graph->expression, x1, y1, error, sizeof(error));
-            double f10 = evaluate_implicit_equation(graph->expression, x2, y1, error, sizeof(error));
-            double f01 = evaluate_implicit_equation(graph->expression, x1, y2, error, sizeof(error));
-            double f11 = evaluate_implicit_equation(graph->expression, x2, y2, error, sizeof(error));
-            if (error[0] != '\0') {
-                g_app.has_error = true;
-                snprintf(g_app.error, sizeof(g_app.error), "Graph %d: %s", graph_index + 1, error);
-                SelectObject(hdc, old_pen);
-                DeleteObject(pen);
-                return;
-            }
-            if (!isfinite(f00) || !isfinite(f10) || !isfinite(f01) || !isfinite(f11)) continue;
-
-            POINT hits[4];
-            int hit_count = 0;
-            double values_a[4] = { f00, f10, f11, f01 };
-            double values_b[4] = { f10, f11, f01, f00 };
-            POINT points_a[4] = { { sx, sy }, { sx + cell, sy }, { sx + cell, sy + cell }, { sx, sy + cell } };
-            POINT points_b[4] = { { sx + cell, sy }, { sx + cell, sy + cell }, { sx, sy + cell }, { sx, sy } };
-
-            for (int edge = 0; edge < 4; edge++) {
-                double a = values_a[edge];
-                double b = values_b[edge];
-                if ((a <= 0.0 && b >= 0.0) || (a >= 0.0 && b <= 0.0)) {
-                    double denom = a - b;
-                    double t = fabs(denom) < 1e-12 ? 0.5 : a / denom;
-                    if (t < 0.0) t = 0.0;
-                    if (t > 1.0) t = 1.0;
-                    hits[hit_count].x = points_a[edge].x + (int)lround((points_b[edge].x - points_a[edge].x) * t);
-                    hits[hit_count].y = points_a[edge].y + (int)lround((points_b[edge].y - points_a[edge].y) * t);
-                    hit_count++;
-                    if (hit_count == 4) break;
-                }
-            }
-
-            if (hit_count >= 2) {
-                MoveToEx(hdc, hits[0].x, hits[0].y, NULL);
-                LineTo(hdc, hits[1].x, hits[1].y);
-                if (hit_count == 4) {
-                    MoveToEx(hdc, hits[2].x, hits[2].y, NULL);
-                    LineTo(hdc, hits[3].x, hits[3].y);
-                }
-            }
-        }
-    }
-
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen);
-}
-
-static POINT project_3d(double x, double y, double z, RECT plot) {
-    double rz = g_app.rotation_z;
-    double rx = g_app.rotation_x;
-    double cz = cos(rz), sz = sin(rz);
-    double cx = cos(rx), sx = sin(rx);
-
-    double x1 = x * cz - y * sz;
-    double y1 = x * sz + y * cz;
-    double y2 = y1 * cx - z * sx;
-
-    POINT p;
-    p.x = plot.left + (plot.right - plot.left) / 2 + (int)lround(x1 * g_app.scale);
-    p.y = plot.top + (plot.bottom - plot.top) / 2 - (int)lround(y2 * g_app.scale);
-    return p;
-}
-
-static void draw_3d_axes(HDC hdc, RECT plot) {
-    ThemeColors c = theme();
-    double span_x = (plot.right - plot.left) / (2.0 * g_app.scale);
-    double span_y = (plot.bottom - plot.top) / (2.0 * g_app.scale);
-    double span = fmin(span_x, span_y);
-    if (span < 1.0) span = 1.0;
-
-    struct {
-        double x1, y1, z1;
-        double x2, y2, z2;
-        COLORREF color;
-        const char *label;
-    } axes[] = {
-        { -span, 0.0, 0.0, span, 0.0, 0.0, RGB(220, 38, 38), "X" },
-        { 0.0, -span, 0.0, 0.0, span, 0.0, RGB(5, 150, 105), "Y" },
-        { 0.0, 0.0, -span, 0.0, 0.0, span, c.accent, "Z" }
-    };
-
-    HFONT old_font = SelectObject(hdc, g_app.small_font);
-    SetBkMode(hdc, TRANSPARENT);
-
-    for (int i = 0; i < 3; i++) {
-        POINT start = project_3d(axes[i].x1, axes[i].y1, axes[i].z1, plot);
-        POINT end = project_3d(axes[i].x2, axes[i].y2, axes[i].z2, plot);
-        HPEN pen = CreatePen(PS_SOLID, 2, axes[i].color);
-        HPEN old_pen = SelectObject(hdc, pen);
-        MoveToEx(hdc, start.x, start.y, NULL);
-        LineTo(hdc, end.x, end.y);
-        SelectObject(hdc, old_pen);
-        DeleteObject(pen);
-
-        SetTextColor(hdc, axes[i].color);
-        draw_text_utf8(hdc, end.x + 6, end.y - 14, axes[i].label);
-    }
-
-    POINT origin = project_3d(0.0, 0.0, 0.0, plot);
-    HBRUSH origin_brush = CreateSolidBrush(c.axis);
-    HBRUSH old_brush = SelectObject(hdc, origin_brush);
-    HPEN origin_pen = CreatePen(PS_SOLID, 1, c.axis);
-    HPEN old_pen = SelectObject(hdc, origin_pen);
-    Ellipse(hdc, origin.x - 3, origin.y - 3, origin.x + 4, origin.y + 4);
-    SelectObject(hdc, old_pen);
-    SelectObject(hdc, old_brush);
-    DeleteObject(origin_pen);
-    DeleteObject(origin_brush);
-    SelectObject(hdc, old_font);
-}
-
-static void draw_surface_graph(HDC hdc, RECT plot, int graph_index) {
-    Graph *graph = &g_app.graphs[graph_index];
-    if (!graph->visible || graph_kind(graph) != GRAPH_SURFACE_3D) return;
-
-    HPEN pen = CreatePen(PS_SOLID, graph_index == g_app.selected_graph ? 2 : 1, graph->color);
-    HPEN old_pen = SelectObject(hdc, pen);
-    char error[160] = {0};
-    double span_x = (plot.right - plot.left) / (2.0 * g_app.scale);
-    double span_y = (plot.bottom - plot.top) / (2.0 * g_app.scale);
-    double span = fmin(span_x, span_y);
-    if (span < 1.0) span = 1.0;
-    double step = span / 12.0;
-
-    for (int pass = 0; pass < 2; pass++) {
-        for (double a = -span; a <= span + step * 0.5; a += step) {
-            bool drawing = false;
-            for (double b = -span; b <= span + step * 0.5; b += step) {
-                double x = pass == 0 ? a : b;
-                double y = pass == 0 ? b : a;
-                double z = evaluate_graph_value(graph->expression, x, y, error, sizeof(error));
-                if (error[0] != '\0') {
-                    g_app.has_error = true;
-                    snprintf(g_app.error, sizeof(g_app.error), "Graph %d: %s", graph_index + 1, error);
-                    SelectObject(hdc, old_pen);
-                    DeleteObject(pen);
-                    return;
-                }
-                if (!isfinite(z) || fabs(z) > span * 4.0) {
-                    drawing = false;
-                    continue;
-                }
-                POINT p = project_3d(x, y, z, plot);
-                if (!drawing) {
-                    MoveToEx(hdc, p.x, p.y, NULL);
-                    drawing = true;
-                } else {
-                    LineTo(hdc, p.x, p.y);
-                }
-            }
-        }
-    }
-
-    SelectObject(hdc, old_pen);
-    DeleteObject(pen);
-}
-
 static bool refine_root(const char *expr, double left, double right, double *root) {
     char error[160] = {0};
-    double fl = evaluate_graph_value(expr, left, 0.0, error, sizeof(error));
+    double fl = evaluate_expression(expr, left, error, sizeof(error));
     if (error[0] != '\0' || !isfinite(fl)) return false;
-    double fr = evaluate_graph_value(expr, right, 0.0, error, sizeof(error));
+    double fr = evaluate_expression(expr, right, error, sizeof(error));
     if (error[0] != '\0' || !isfinite(fr)) return false;
     if (fabs(fl) < 1e-9) {
         *root = left;
@@ -1551,7 +1263,7 @@ static bool refine_root(const char *expr, double left, double right, double *roo
     // Bisection is slower than Newton's method but stable for hover snapping.
     for (int i = 0; i < 48; i++) {
         double mid = (left + right) * 0.5;
-        double fm = evaluate_graph_value(expr, mid, 0.0, error, sizeof(error));
+        double fm = evaluate_expression(expr, mid, error, sizeof(error));
         if (error[0] != '\0' || !isfinite(fm)) return false;
         if (fabs(fm) < 1e-10) {
             *root = mid;
@@ -1596,12 +1308,11 @@ static void update_hover(HWND hwnd, int mx, int my) {
 
     for (int i = 0; i < g_app.graph_count; i++) {
         Graph *graph = &g_app.graphs[i];
-        if (graph_kind(graph) != GRAPH_FUNCTION_2D) continue;
         for (int dx = -8; dx <= 8; dx++) {
             int sx = mx + dx;
             if (sx < plot.left || sx > plot.right) continue;
             double x = screen_to_world_x(sx, plot);
-            double y = evaluate_graph_value(graph->expression, x, 0.0, error, sizeof(error));
+            double y = evaluate_expression(graph->expression, x, error, sizeof(error));
             if (error[0] != '\0' || !isfinite(y)) continue;
             int sy = world_to_screen_y(y, plot);
             double dist = hypot((double)(sx - mx), (double)(sy - my));
@@ -1630,7 +1341,7 @@ static void update_hover(HWND hwnd, int mx, int my) {
             }
         }
 
-        double y_intercept = evaluate_graph_value(graph->expression, 0.0, 0.0, error, sizeof(error));
+        double y_intercept = evaluate_expression(graph->expression, 0.0, error, sizeof(error));
         if (error[0] == '\0' && isfinite(y_intercept)) {
             int sx = world_to_screen_x(0.0, plot);
             int sy = world_to_screen_y(y_intercept, plot);
@@ -1838,8 +1549,7 @@ static bool is_primary_button(int id) {
 
 static bool is_selected_mode_button(int id) {
     return (id == MODE_GRAPH_ID && !g_app.scientific_mode) ||
-           (id == MODE_SCI_ID && g_app.scientific_mode) ||
-           (id == MODE_3D_ID && g_app.graph3d_mode);
+           (id == MODE_SCI_ID && g_app.scientific_mode);
 }
 
 static void draw_owner_button(const DRAWITEMSTRUCT *item) {
@@ -1911,9 +1621,8 @@ static void update_menu_checks(HWND hwnd) {
     CheckMenuItem(menu, MENU_DARK_ID, MF_BYCOMMAND | (g_app.dark_mode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_DECIMAL_OUTPUT_ID, MF_BYCOMMAND | (!g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_FRACTION_OUTPUT_ID, MF_BYCOMMAND | (g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(menu, MODE_GRAPH_ID, MF_BYCOMMAND | (!g_app.scientific_mode && !g_app.graph3d_mode ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, MODE_GRAPH_ID, MF_BYCOMMAND | (!g_app.scientific_mode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MODE_SCI_ID, MF_BYCOMMAND | (g_app.scientific_mode ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(menu, MODE_3D_ID, MF_BYCOMMAND | (g_app.graph3d_mode ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static HMENU create_app_menu(void) {
@@ -1922,7 +1631,6 @@ static HMENU create_app_menu(void) {
     HMENU graphs = CreatePopupMenu();
     HMENU settings = CreatePopupMenu();
     AppendMenuW(mode, MF_STRING, MODE_GRAPH_ID, L"Graphing calculator");
-    AppendMenuW(mode, MF_STRING, MODE_3D_ID, L"3D graphing calculator");
     AppendMenuW(mode, MF_STRING, MODE_SCI_ID, L"Scientific calculator");
     AppendMenuW(graphs, MF_STRING, SAVE_GRAPHS_ID, L"Save graph set...");
     AppendMenuW(graphs, MF_STRING, IMPORT_GRAPHS_ID, L"Import graph set...");
@@ -1953,9 +1661,8 @@ static void draw_sidebar(HDC hdc, RECT client) {
     TextOutW(hdc, 24, 24, L"Local Calculator", 16);
 
     SetTextColor(hdc, c.muted);
-    const wchar_t *subtitle = g_app.scientific_mode ? L"Scientific workspace" :
-        (g_app.graph3d_mode ? L"3D graphing workspace" : L"Graphing workspace");
-    TextOutW(hdc, 24, 48, subtitle, lstrlenW(subtitle));
+    TextOutW(hdc, 24, 48, g_app.scientific_mode ? L"Scientific workspace" : L"Graphing workspace",
+        g_app.scientific_mode ? 20 : 18);
 
     RECT input_panel = {18, 72, 294, g_app.scientific_mode ? 412 : 422};
     fill_round_rect(hdc, input_panel, 14, g_app.dark_mode ? RGB(18, 25, 38) : RGB(250, 252, 255), c.panel_border);
@@ -1963,8 +1670,6 @@ static void draw_sidebar(HDC hdc, RECT client) {
     TextOutW(hdc, 24, g_app.scientific_mode ? 440 : 450, L"Keys", 4);
     if (g_app.scientific_mode) {
         TextOutW(hdc, 24, 238, L"History", 7);
-    } else if (g_app.graph3d_mode) {
-        TextOutW(hdc, 24, 192, L"3D Surfaces", 11);
     } else {
         TextOutW(hdc, 24, 192, L"Graphs", 6);
     }
@@ -1997,14 +1702,11 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.center_x = 0.0;
         g_app.center_y = 0.0;
         g_app.scale = 45.0;
-        g_app.rotation_x = 0.8;
-        g_app.rotation_z = -0.7;
         g_app.selected_graph = -1;
         g_app.next_color = DEFAULT_COLORS[0];
         g_app.degrees = false;
         g_app.dark_mode = false;
         g_app.scientific_mode = false;
-        g_app.graph3d_mode = false;
         g_app.scientific_fraction_output = false;
 
         SetMenu(hwnd, create_app_menu());
@@ -2060,8 +1762,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_COMMAND: {
         int id = LOWORD(wparam);
-        if (id == MODE_GRAPH_ID || id == MODE_SCI_ID || id == MODE_3D_ID) {
-            set_calculator_mode(hwnd, id == MODE_SCI_ID, id == MODE_3D_ID);
+        if (id == MODE_GRAPH_ID || id == MODE_SCI_ID) {
+            set_calculator_mode(hwnd, id == MODE_SCI_ID);
         } else if (id == SCI_CALC_ID) {
             calculate_scientific_result();
             InvalidateRect(hwnd, NULL, FALSE);
@@ -2147,18 +1849,6 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MOUSEMOVE:
         if (g_app.scientific_mode) return 0;
-        if (g_app.dragging_3d) {
-            int mx = GET_X_LPARAM(lparam);
-            int my = GET_Y_LPARAM(lparam);
-            g_app.rotation_z += (mx - g_app.last_mouse.x) * 0.01;
-            g_app.rotation_x += (my - g_app.last_mouse.y) * 0.01;
-            if (g_app.rotation_x < -1.45) g_app.rotation_x = -1.45;
-            if (g_app.rotation_x > 1.45) g_app.rotation_x = 1.45;
-            g_app.last_mouse.x = mx;
-            g_app.last_mouse.y = my;
-            invalidate_plot(hwnd);
-            return 0;
-        }
         {
             TRACKMOUSEEVENT track = {0};
             track.cbSize = sizeof(track);
@@ -2166,26 +1856,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             track.hwndTrack = hwnd;
             TrackMouseEvent(&track);
         }
-        if (!g_app.graph3d_mode) update_hover(hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
+        update_hover(hwnd, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
         return 0;
-
-    case WM_LBUTTONDOWN:
-        if (g_app.graph3d_mode && has_surface_graph()) {
-            g_app.dragging_3d = true;
-            g_app.last_mouse.x = GET_X_LPARAM(lparam);
-            g_app.last_mouse.y = GET_Y_LPARAM(lparam);
-            SetCapture(hwnd);
-            return 0;
-        }
-        break;
-
-    case WM_LBUTTONUP:
-        if (g_app.dragging_3d) {
-            g_app.dragging_3d = false;
-            ReleaseCapture();
-            return 0;
-        }
-        break;
 
     case WM_MOUSELEAVE:
         if (g_app.hover_valid) {
@@ -2256,18 +1928,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             SelectClipRgn(hdc, plot_region);
             g_app.has_error = false;
             draw_grid(hdc, plot);
-            if (g_app.graph3d_mode) {
-                draw_3d_axes(hdc, plot);
-            }
             for (int i = 0; i < g_app.graph_count; i++) {
-                if (g_app.graph3d_mode) {
-                    draw_surface_graph(hdc, plot, i);
-                } else {
-                    draw_graph(hdc, plot, i);
-                    draw_implicit_graph(hdc, plot, i);
-                }
+                draw_graph(hdc, plot, i);
             }
-            if (!g_app.graph3d_mode) draw_hover(hdc, plot);
+            draw_hover(hdc, plot);
             SelectClipRgn(hdc, NULL);
             DeleteObject(plot_region);
 
