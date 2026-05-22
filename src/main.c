@@ -744,9 +744,8 @@ static void set_calculator_mode(HWND hwnd, bool scientific_mode, bool graph3d_mo
     g_app.hover_valid = false;
     g_app.has_error = false;
     g_app.error[0] = '\0';
-    if (!g_app.scientific_mode) {
-        set_input_from_graph(g_app.selected_graph);
-    }
+    SetWindowTextW(g_app.input, L"");
+    if (g_app.scientific_mode) SetWindowTextW(g_app.scientific_result, L"= ");
     update_menu_checks(hwnd);
     layout_controls(hwnd);
     update_status();
