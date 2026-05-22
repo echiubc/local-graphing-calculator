@@ -41,6 +41,7 @@
 #define SAVE_GRAPHS_ID 1015
 #define IMPORT_GRAPHS_ID 1016
 #define SCI_HISTORY_ID 1017
+#define SCI_OUTPUT_TOGGLE_ID 1018
 #define PAD_BASE_ID 2000
 #define MENU_RAD_ID 3001
 #define MENU_DEG_ID 3002
@@ -58,6 +59,10 @@ typedef struct {
     COLORREF text;
     COLORREF muted;
     COLORREF error;
+    COLORREF accent;
+    COLORREF accent_soft;
+    COLORREF control_bg;
+    COLORREF control_border;
 } ThemeColors;
 
 typedef struct {
@@ -97,6 +102,7 @@ typedef struct {
     HWND zoom_out_button;
     HWND reset_button;
     HWND scientific_calc_button;
+    HWND scientific_output_toggle;
     HWND scientific_result;
     HWND scientific_history;
     HWND status;
@@ -160,26 +166,34 @@ static ThemeColors theme(void) {
     if (g_app.dark_mode) {
         ThemeColors dark = {
             RGB(15, 23, 42),
-            RGB(24, 32, 48),
-            RGB(71, 85, 105),
-            RGB(51, 65, 85),
-            RGB(203, 213, 225),
+            RGB(24, 30, 44),
+            RGB(55, 65, 81),
+            RGB(43, 53, 70),
+            RGB(210, 220, 235),
             RGB(226, 232, 240),
             RGB(148, 163, 184),
-            RGB(251, 113, 133)
+            RGB(251, 113, 133),
+            RGB(96, 165, 250),
+            RGB(30, 64, 111),
+            RGB(30, 41, 59),
+            RGB(71, 85, 105)
         };
         return dark;
     }
 
     ThemeColors light = {
-        RGB(246, 248, 252),
+        RGB(244, 247, 251),
         RGB(255, 255, 255),
-        RGB(210, 218, 232),
-        RGB(226, 231, 240),
-        RGB(75, 85, 99),
+        RGB(218, 226, 239),
+        RGB(229, 234, 244),
+        RGB(71, 85, 105),
         RGB(31, 41, 55),
         RGB(100, 116, 139),
-        RGB(190, 18, 60)
+        RGB(190, 18, 60),
+        RGB(37, 99, 235),
+        RGB(219, 234, 254),
+        RGB(248, 250, 252),
+        RGB(203, 213, 225)
     };
     return light;
 }
@@ -191,7 +205,28 @@ static void rebuild_brushes(void) {
     if (g_app.control_bg_brush) DeleteObject(g_app.control_bg_brush);
     g_app.app_bg_brush = CreateSolidBrush(c.app_bg);
     g_app.panel_bg_brush = CreateSolidBrush(c.panel_bg);
-    g_app.control_bg_brush = CreateSolidBrush(c.panel_bg);
+    g_app.control_bg_brush = CreateSolidBrush(c.control_bg);
+}
+
+static COLORREF blend_color(COLORREF a, COLORREF b, double t) {
+    int ar = GetRValue(a), ag = GetGValue(a), ab = GetBValue(a);
+    int br = GetRValue(b), bg = GetGValue(b), bb = GetBValue(b);
+    int r = (int)lround(ar + (br - ar) * t);
+    int g = (int)lround(ag + (bg - ag) * t);
+    int bl = (int)lround(ab + (bb - ab) * t);
+    return RGB(r, g, bl);
+}
+
+static void fill_round_rect(HDC hdc, RECT rect, int radius, COLORREF fill, COLORREF border) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HBRUSH old_brush = SelectObject(hdc, brush);
+    HPEN old_pen = SelectObject(hdc, pen);
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(brush);
+    DeleteObject(pen);
 }
 
 static HFONT create_app_font(int point_size, int weight, const wchar_t *face_name) {
@@ -490,6 +525,10 @@ static RECT plot_rect(HWND hwnd);
 static void read_input_expression(char *out, size_t out_size);
 static void append_to_input(const wchar_t *text);
 static void update_menu_checks(HWND hwnd);
+static void set_input_from_graph(int index);
+static void refresh_calculation_history(void);
+static void layout_controls(HWND hwnd);
+static void update_status(void);
 FILE *_wfopen(const wchar_t *filename, const wchar_t *mode);
 
 static long long gcd_ll(long long a, long long b) {
@@ -567,6 +606,35 @@ static void update_scientific_result_display(void) {
     _snwprintf(label, sizeof(label) / sizeof(label[0]), L"= %ls", text);
     label[(sizeof(label) / sizeof(label[0])) - 1] = L'\0';
     SetWindowTextW(g_app.scientific_result, label);
+}
+
+static void update_scientific_output_toggle_text(void) {
+    SetWindowTextW(g_app.scientific_output_toggle,
+        g_app.scientific_fraction_output ? L"Show decimal" : L"Show fraction");
+}
+
+static void set_calculator_mode(HWND hwnd, bool scientific_mode) {
+    g_app.scientific_mode = scientific_mode;
+    g_app.hover_valid = false;
+    g_app.has_error = false;
+    g_app.error[0] = '\0';
+    if (!g_app.scientific_mode) {
+        set_input_from_graph(g_app.selected_graph);
+    }
+    update_menu_checks(hwnd);
+    layout_controls(hwnd);
+    update_status();
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+
+static void set_scientific_output_mode(HWND hwnd, bool fraction_output) {
+    g_app.scientific_fraction_output = fraction_output;
+    update_menu_checks(hwnd);
+    update_scientific_output_toggle_text();
+    update_scientific_result_display();
+    refresh_calculation_history();
+    update_status();
+    InvalidateRect(hwnd, NULL, TRUE);
 }
 
 static double screen_to_world_x(int sx, RECT plot) {
@@ -1230,9 +1298,9 @@ static void draw_hover(HDC hdc, RECT plot) {
 static RECT plot_rect(HWND hwnd) {
     RECT client;
     GetClientRect(hwnd, &client);
-    client.left += 300;
+    client.left += 308;
     client.top += 68;
-    client.right -= 18;
+    client.right -= 22;
     client.bottom -= 54;
     return client;
 }
@@ -1241,32 +1309,30 @@ static void layout_controls(HWND hwnd) {
     RECT client;
     GetClientRect(hwnd, &client);
 
-    int margin = 18;
-    int sidebar_w = 264;
+    int margin = 20;
+    int sidebar_w = 268;
     int input_h = 32;
     int button_h = 30;
     int gap = 8;
-    int y = margin;
-
-    int half = (sidebar_w - gap) / 2;
-    MoveWindow(g_app.graph_mode_button, margin, y, half, button_h, TRUE);
-    MoveWindow(g_app.scientific_mode_button, margin + half + gap, y, half, button_h, TRUE);
-    y += button_h + 12;
+    int y = margin + 54;
 
     MoveWindow(g_app.input, margin, y, sidebar_w, input_h, TRUE);
     y += input_h + gap;
 
+    ShowWindow(g_app.graph_mode_button, SW_HIDE);
+    ShowWindow(g_app.scientific_mode_button, SW_HIDE);
     ShowWindow(g_app.add_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.update_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.remove_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.color_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
-    ShowWindow(g_app.save_graphs_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
-    ShowWindow(g_app.import_graphs_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.save_graphs_button, SW_HIDE);
+    ShowWindow(g_app.import_graphs_button, SW_HIDE);
     ShowWindow(g_app.list, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.zoom_out_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.reset_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.zoom_in_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.scientific_calc_button, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.scientific_output_toggle, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.scientific_result, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.scientific_history, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
 
@@ -1276,22 +1342,22 @@ static void layout_controls(HWND hwnd) {
         MoveWindow(g_app.scientific_calc_button, margin, y, sidebar_w, button_h, TRUE);
         y += button_h + gap;
         MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 48, TRUE);
-        y += 48 + gap + 20;
+        y += 48 + gap;
+        MoveWindow(g_app.scientific_output_toggle, margin, y, sidebar_w, button_h, TRUE);
+        y += button_h + gap + 20;
         MoveWindow(g_app.scientific_history, margin, y, sidebar_w, 158, TRUE);
         y += 158 + 18;
     } else {
+    int half = (sidebar_w - gap) / 2;
     MoveWindow(g_app.add_button, margin, y, half, button_h, TRUE);
     MoveWindow(g_app.update_button, margin + half + gap, y, half, button_h, TRUE);
     y += button_h + gap;
     MoveWindow(g_app.remove_button, margin, y, half, button_h, TRUE);
     MoveWindow(g_app.color_button, margin + half + gap, y, half, button_h, TRUE);
     y += button_h + gap;
-    MoveWindow(g_app.save_graphs_button, margin, y, half, button_h, TRUE);
-    MoveWindow(g_app.import_graphs_button, margin + half + gap, y, half, button_h, TRUE);
-    y += button_h + gap;
 
-    MoveWindow(g_app.list, margin, y, sidebar_w, 118, TRUE);
-    y += 118 + gap;
+    MoveWindow(g_app.list, margin, y, sidebar_w, 156, TRUE);
+    y += 156 + gap;
 
     int third = (sidebar_w - gap * 2) / 3;
     MoveWindow(g_app.zoom_out_button, margin, y, third, button_h, TRUE);
@@ -1310,11 +1376,11 @@ static void layout_controls(HWND hwnd) {
         MoveWindow(g_app.pad_buttons[i], margin + col * (pad_w + pad_gap), y + row * (pad_h + pad_gap), pad_w, pad_h, TRUE);
     }
 
-    MoveWindow(g_app.status, 300, client.bottom - 40, client.right - 318, 24, TRUE);
+    MoveWindow(g_app.status, 308, client.bottom - 40, client.right - 326, 24, TRUE);
 }
 
 static HWND create_button(HWND parent, const wchar_t *text, int id) {
-    HWND button = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+    HWND button = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 0, 0, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
     SendMessageW(button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     return button;
@@ -1337,6 +1403,55 @@ static void create_keypad(HWND hwnd) {
     }
 }
 
+static bool is_primary_button(int id) {
+    return id == ADD_ID || id == SCI_CALC_ID || id == SAVE_GRAPHS_ID || id == SCI_OUTPUT_TOGGLE_ID;
+}
+
+static bool is_selected_mode_button(int id) {
+    return (id == MODE_GRAPH_ID && !g_app.scientific_mode) ||
+           (id == MODE_SCI_ID && g_app.scientific_mode);
+}
+
+static void draw_owner_button(const DRAWITEMSTRUCT *item) {
+    ThemeColors c = theme();
+    RECT rect = item->rcItem;
+    int id = (int)item->CtlID;
+    bool selected = is_selected_mode_button(id);
+    bool primary = is_primary_button(id);
+    bool pressed = (item->itemState & ODS_SELECTED) != 0;
+    bool focused = (item->itemState & ODS_FOCUS) != 0;
+
+    COLORREF fill = c.control_bg;
+    COLORREF border = c.control_border;
+    COLORREF text = c.text;
+
+    if (selected || primary) {
+        fill = c.accent;
+        border = c.accent;
+        text = RGB(255, 255, 255);
+    } else if (id >= PAD_BASE_ID && id < PAD_BASE_ID + g_app.pad_count) {
+        fill = blend_color(c.control_bg, c.accent_soft, g_app.dark_mode ? 0.18 : 0.36);
+    }
+
+    if (pressed) {
+        fill = blend_color(fill, RGB(0, 0, 0), g_app.dark_mode ? 0.18 : 0.08);
+    }
+    if (focused && !selected && !primary) {
+        border = c.accent;
+    }
+
+    InflateRect(&rect, -1, -1);
+    fill_round_rect(item->hDC, rect, 8, fill, border);
+
+    wchar_t label[80];
+    GetWindowTextW(item->hwndItem, label, (int)(sizeof(label) / sizeof(label[0])));
+    HFONT old_font = SelectObject(item->hDC, g_app.ui_font);
+    SetTextColor(item->hDC, text);
+    SetBkMode(item->hDC, TRANSPARENT);
+    DrawTextW(item->hDC, label, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(item->hDC, old_font);
+}
+
 static void apply_control_fonts(void) {
     SendMessageW(g_app.graph_mode_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.scientific_mode_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
@@ -1352,6 +1467,7 @@ static void apply_control_fonts(void) {
     SendMessageW(g_app.zoom_out_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.reset_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.scientific_calc_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.scientific_output_toggle, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.scientific_result, WM_SETFONT, (WPARAM)g_app.mono_font, TRUE);
     SendMessageW(g_app.scientific_history, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.status, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
@@ -1365,11 +1481,19 @@ static void update_menu_checks(HWND hwnd) {
     CheckMenuItem(menu, MENU_DARK_ID, MF_BYCOMMAND | (g_app.dark_mode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_DECIMAL_OUTPUT_ID, MF_BYCOMMAND | (!g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_FRACTION_OUTPUT_ID, MF_BYCOMMAND | (g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, MODE_GRAPH_ID, MF_BYCOMMAND | (!g_app.scientific_mode ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, MODE_SCI_ID, MF_BYCOMMAND | (g_app.scientific_mode ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static HMENU create_app_menu(void) {
     HMENU menu = CreateMenu();
+    HMENU mode = CreatePopupMenu();
+    HMENU graphs = CreatePopupMenu();
     HMENU settings = CreatePopupMenu();
+    AppendMenuW(mode, MF_STRING, MODE_GRAPH_ID, L"Graphing calculator");
+    AppendMenuW(mode, MF_STRING, MODE_SCI_ID, L"Scientific calculator");
+    AppendMenuW(graphs, MF_STRING, SAVE_GRAPHS_ID, L"Save graph set...");
+    AppendMenuW(graphs, MF_STRING, IMPORT_GRAPHS_ID, L"Import graph set...");
     AppendMenuW(settings, MF_STRING, MENU_RAD_ID, L"Radians");
     AppendMenuW(settings, MF_STRING, MENU_DEG_ID, L"Degrees");
     AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
@@ -1378,49 +1502,55 @@ static HMENU create_app_menu(void) {
     AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
     AppendMenuW(settings, MF_STRING, MENU_DECIMAL_OUTPUT_ID, L"Decimal output");
     AppendMenuW(settings, MF_STRING, MENU_FRACTION_OUTPUT_ID, L"Fraction output");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)mode, L"Mode");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)graphs, L"Graphs");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, L"Settings");
     return menu;
 }
 
 static void draw_sidebar(HDC hdc, RECT client) {
     ThemeColors c = theme();
-    RECT sidebar = {0, 0, 294, client.bottom};
+    RECT sidebar = {0, 0, 300, client.bottom};
+    RECT rail = {12, 12, 300, client.bottom - 12};
     FillRect(hdc, &sidebar, g_app.app_bg_brush);
+    fill_round_rect(hdc, rail, 18, c.panel_bg, c.panel_border);
 
     HFONT old_font = SelectObject(hdc, g_app.ui_font);
-    SetTextColor(hdc, c.muted);
     SetBkMode(hdc, TRANSPARENT);
-    TextOutW(hdc, 18, g_app.scientific_mode ? 360 : 398, L"Keys", 4);
+    SetTextColor(hdc, c.text);
+    TextOutW(hdc, 24, 24, L"Local Calculator", 16);
+
+    SetTextColor(hdc, c.muted);
+    TextOutW(hdc, 24, 48, g_app.scientific_mode ? L"Scientific workspace" : L"Graphing workspace",
+        g_app.scientific_mode ? 20 : 18);
+
+    RECT input_panel = {18, 64, 294, g_app.scientific_mode ? 398 : 412};
+    fill_round_rect(hdc, input_panel, 14, g_app.dark_mode ? RGB(18, 25, 38) : RGB(250, 252, 255), c.panel_border);
+
+    TextOutW(hdc, 24, g_app.scientific_mode ? 426 : 440, L"Keys", 4);
     if (g_app.scientific_mode) {
-        TextOutW(hdc, 18, 94, L"Result", 6);
-        TextOutW(hdc, 18, 196, L"History", 7);
+        TextOutW(hdc, 24, 220, L"History", 7);
     } else {
-        TextOutW(hdc, 18, 14 + 30 + 12 + 32 + 8 + 30 + 8 + 30 + 8 + 30 + 8 - 18, L"Graphs", 6);
+        TextOutW(hdc, 24, 184, L"Graphs", 6);
     }
     SelectObject(hdc, old_font);
 }
 
 static void draw_scientific_workspace(HDC hdc, RECT client) {
     ThemeColors c = theme();
-    RECT panel = {300, 68, client.right - 18, client.bottom - 54};
-    HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
-    HBRUSH old_brush = SelectObject(hdc, g_app.panel_bg_brush);
-    HPEN old_pen = SelectObject(hdc, border_pen);
-    RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 14, 14);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
+    RECT panel = {308, 68, client.right - 22, client.bottom - 54};
+    fill_round_rect(hdc, panel, 18, c.panel_bg, c.panel_border);
 
     HFONT old_font = SelectObject(hdc, g_app.ui_font);
     SetTextColor(hdc, c.text);
     SetBkMode(hdc, TRANSPARENT);
-    TextOutW(hdc, panel.left + 24, panel.top + 24, L"Scientific Calculator", 21);
+    TextOutW(hdc, panel.left + 28, panel.top + 26, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
     const wchar_t *help = L"Type an expression, decimal, fraction, or mixed number, then press Calculate or Enter.";
     const wchar_t *functions = L"Settings can show scientific results as decimals or fractions; ans keeps full precision.";
-    TextOutW(hdc, panel.left + 24, panel.top + 56, help, lstrlenW(help));
-    TextOutW(hdc, panel.left + 24, panel.top + 88, functions, lstrlenW(functions));
+    TextOutW(hdc, panel.left + 28, panel.top + 60, help, lstrlenW(help));
+    TextOutW(hdc, panel.left + 28, panel.top + 92, functions, lstrlenW(functions));
     SelectObject(hdc, old_font);
-    DeleteObject(border_pen);
 }
 
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -1453,17 +1583,18 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.color_button = create_button(hwnd, L"Color", COLOR_ID);
         g_app.save_graphs_button = create_button(hwnd, L"Save set", SAVE_GRAPHS_ID);
         g_app.import_graphs_button = create_button(hwnd, L"Import", IMPORT_GRAPHS_ID);
-        g_app.list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        g_app.list = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)LIST_ID, GetModuleHandleW(NULL), NULL);
         g_app.zoom_out_button = create_button(hwnd, L"-", ZOOM_OUT_ID);
         g_app.reset_button = create_button(hwnd, L"Reset", RESET_ID);
         g_app.zoom_in_button = create_button(hwnd, L"+", ZOOM_IN_ID);
         g_app.scientific_calc_button = create_button(hwnd, L"Calculate", SCI_CALC_ID);
-        g_app.scientific_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"= ",
+        g_app.scientific_output_toggle = create_button(hwnd, L"Show fraction", SCI_OUTPUT_TOGGLE_ID);
+        g_app.scientific_result = CreateWindowExW(0, L"STATIC", L"= ",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             0, 0, 0, 0, hwnd, (HMENU)SCI_RESULT_ID, GetModuleHandleW(NULL), NULL);
-        g_app.scientific_history = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        g_app.scientific_history = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)SCI_HISTORY_ID, GetModuleHandleW(NULL), NULL);
         g_app.status = CreateWindowW(L"STATIC", L"",
@@ -1471,6 +1602,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         create_keypad(hwnd);
 
         apply_control_fonts();
+        update_scientific_output_toggle_text();
         add_graph_from_input(hwnd);
         layout_controls(hwnd);
         update_status();
@@ -1484,22 +1616,19 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_ERASEBKGND:
         return 1;
 
+    case WM_DRAWITEM:
+        draw_owner_button((const DRAWITEMSTRUCT *)lparam);
+        return TRUE;
+
     case WM_COMMAND: {
         int id = LOWORD(wparam);
         if (id == MODE_GRAPH_ID || id == MODE_SCI_ID) {
-            g_app.scientific_mode = id == MODE_SCI_ID;
-            g_app.hover_valid = false;
-            g_app.has_error = false;
-            g_app.error[0] = '\0';
-            if (!g_app.scientific_mode) {
-                set_input_from_graph(g_app.selected_graph);
-            }
-            layout_controls(hwnd);
-            update_status();
-            InvalidateRect(hwnd, NULL, TRUE);
+            set_calculator_mode(hwnd, id == MODE_SCI_ID);
         } else if (id == SCI_CALC_ID) {
             calculate_scientific_result();
             InvalidateRect(hwnd, NULL, FALSE);
+        } else if (id == SCI_OUTPUT_TOGGLE_ID) {
+            set_scientific_output_mode(hwnd, !g_app.scientific_fraction_output);
         } else if (id == SAVE_GRAPHS_ID) {
             save_graphs(hwnd);
         } else if (id == IMPORT_GRAPHS_ID) {
@@ -1548,12 +1677,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             update_status();
             InvalidateRect(hwnd, NULL, TRUE);
         } else if (id == MENU_DECIMAL_OUTPUT_ID || id == MENU_FRACTION_OUTPUT_ID) {
-            g_app.scientific_fraction_output = id == MENU_FRACTION_OUTPUT_ID;
-            update_menu_checks(hwnd);
-            update_scientific_result_display();
-            refresh_calculation_history();
-            update_status();
-            InvalidateRect(hwnd, NULL, TRUE);
+            set_scientific_output_mode(hwnd, id == MENU_FRACTION_OUTPUT_ID);
         }
         return 0;
     }
@@ -1561,14 +1685,14 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_CTLCOLOREDIT: {
         ThemeColors c = theme();
         SetTextColor((HDC)wparam, c.text);
-        SetBkColor((HDC)wparam, c.panel_bg);
+        SetBkColor((HDC)wparam, c.control_bg);
         return (LRESULT)g_app.control_bg_brush;
     }
 
     case WM_CTLCOLORLISTBOX: {
         ThemeColors c = theme();
-        SetTextColor((HDC)wparam, g_app.has_error ? c.error : c.muted);
-        SetBkColor((HDC)wparam, c.panel_bg);
+        SetTextColor((HDC)wparam, g_app.has_error ? c.error : c.text);
+        SetBkColor((HDC)wparam, c.control_bg);
         return (LRESULT)g_app.control_bg_brush;
     }
 
@@ -1576,7 +1700,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         ThemeColors c = theme();
         SetTextColor((HDC)wparam, g_app.has_error ? c.error : c.muted);
         if ((HWND)lparam == g_app.scientific_result) {
-            SetBkColor((HDC)wparam, c.panel_bg);
+            SetBkColor((HDC)wparam, c.control_bg);
             return (LRESULT)g_app.control_bg_brush;
         }
         SetBkColor((HDC)wparam, c.app_bg);
@@ -1651,14 +1775,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             draw_scientific_workspace(hdc, client);
         } else {
             RECT plot = plot_rect(hwnd);
-            HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
-            HBRUSH old_brush = SelectObject(hdc, g_app.panel_bg_brush);
-            HPEN old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-            RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
+            fill_round_rect(hdc, plot, 18, c.panel_bg, c.panel_border);
 
-            HRGN plot_region = CreateRoundRectRgn(plot.left + 1, plot.top + 1, plot.right, plot.bottom, 14, 14);
+            HRGN plot_region = CreateRoundRectRgn(plot.left + 1, plot.top + 1, plot.right, plot.bottom, 18, 18);
             SelectClipRgn(hdc, plot_region);
             g_app.has_error = false;
             draw_grid(hdc, plot);
@@ -1669,9 +1788,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             SelectClipRgn(hdc, NULL);
             DeleteObject(plot_region);
 
-            old_pen = SelectObject(hdc, border_pen);
-            old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
+            HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
+            HPEN old_pen = SelectObject(hdc, border_pen);
+            HBRUSH old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 18, 18);
             SelectObject(hdc, old_brush);
             SelectObject(hdc, old_pen);
             DeleteObject(border_pen);
