@@ -1,6 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -O2
-LDFLAGS ?= -mwindows -lgdi32 -luser32 -lm
+LDFLAGS ?= -mwindows -lgdi32 -luser32 -lcomdlg32 -lm
 TARGET = graphcalc.exe
 SRC = src/main.c
 
