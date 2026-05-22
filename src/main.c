@@ -116,7 +116,7 @@ typedef struct {
     HBRUSH control_bg_brush;
     Graph graphs[MAX_GRAPHS];
     Calculation calculations[128];
-    double variables[26];
+    double variables[52];
     int graph_count;
     int selected_graph;
     int calculation_count;
@@ -129,7 +129,7 @@ typedef struct {
     bool dark_mode;
     bool scientific_mode;
     bool scientific_fraction_output;
-    bool has_variable[26];
+    bool has_variable[52];
     bool has_answer;
     bool has_error;
     char error[160];
@@ -273,6 +273,12 @@ static void skip_spaces(Parser *p) {
 static int ascii_lower(int c) {
     if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
     return c;
+}
+
+static int variable_index(char c) {
+    if (c >= 'a' && c <= 'z') return c - 'a';
+    if (c >= 'A' && c <= 'Z') return 26 + (c - 'A');
+    return -1;
 }
 
 static bool ascii_word_equals(const char *left, const char *right) {
@@ -456,8 +462,8 @@ static double parse_primary(Parser *p) {
         memcpy(name, p->text + start, len);
 
         if (len == 1) {
-            int index = ascii_lower((unsigned char)name[0]) - 'a';
-            if (index >= 0 && index < 26 && index != ('x' - 'a')) {
+            int index = variable_index(name[0]);
+            if (index >= 0 && name[0] != 'x') {
                 if (g_app.has_variable[index]) return g_app.variables[index];
                 set_error(p, "Variable has not been assigned.");
                 return NAN;
@@ -799,7 +805,7 @@ static bool parse_variable_assignment(const char *expr, char *name, const char *
     while (*p == ' ' || *p == '\t') p++;
     if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) return false;
 
-    char variable = (char)ascii_lower((unsigned char)*p);
+    char variable = *p;
     p++;
     while (*p == ' ' || *p == '\t') p++;
     if (*p != '=') return false;
@@ -856,7 +862,7 @@ static void calculate_scientific_result(void) {
         g_app.last_answer = result;
         g_app.has_answer = true;
         if (is_assignment) {
-            int index = variable - 'a';
+            int index = variable_index(variable);
             g_app.variables[index] = result;
             g_app.has_variable[index] = true;
         }
@@ -1626,7 +1632,7 @@ static void draw_scientific_workspace(HDC hdc, RECT client) {
     TextOutW(hdc, panel.left + 28, panel.top + 26, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
     const wchar_t *help = L"Type an expression, decimal, fraction, or mixed number, then press Calculate or Enter.";
-    const wchar_t *functions = L"Use a = 5 to store variables; ans keeps full precision for follow-up calculations.";
+    const wchar_t *functions = L"Use a = 5 or A = 7 to store case-sensitive variables; ans keeps full precision.";
     TextOutW(hdc, panel.left + 28, panel.top + 60, help, lstrlenW(help));
     TextOutW(hdc, panel.left + 28, panel.top + 92, functions, lstrlenW(functions));
     SelectObject(hdc, old_font);
