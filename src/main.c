@@ -276,6 +276,43 @@ static bool match_word(Parser *p, const char *word) {
 
 static double parse_expression(Parser *p);
 
+static bool number_can_start(char c) {
+    return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-';
+}
+
+static bool parse_fraction_tail(Parser *p, double numerator, double *value) {
+    size_t slash_pos = p->pos;
+    skip_spaces(p);
+    if (p->text[p->pos] != '/') {
+        p->pos = slash_pos;
+        return false;
+    }
+
+    size_t denominator_start = p->pos + 1;
+    while (p->text[denominator_start] == ' ' || p->text[denominator_start] == '\t') {
+        denominator_start++;
+    }
+    if (!number_can_start(p->text[denominator_start])) {
+        p->pos = slash_pos;
+        return false;
+    }
+
+    char *end = NULL;
+    double denominator = strtod(p->text + denominator_start, &end);
+    if (end == p->text + denominator_start) {
+        p->pos = slash_pos;
+        return false;
+    }
+    if (denominator == 0.0) {
+        set_error(p, "Fraction denominator cannot be zero.");
+        return true;
+    }
+
+    p->pos = (size_t)(end - p->text);
+    *value = numerator / denominator;
+    return true;
+}
+
 static double parse_number(Parser *p) {
     skip_spaces(p);
     char *end = NULL;
@@ -285,6 +322,28 @@ static double parse_number(Parser *p) {
         return NAN;
     }
     p->pos = (size_t)(end - p->text);
+
+    double fraction_value = 0.0;
+    if (parse_fraction_tail(p, value, &fraction_value)) {
+        return p->error[0] == '\0' ? fraction_value : NAN;
+    }
+
+    size_t mixed_start = p->pos;
+    while (p->text[mixed_start] == ' ' || p->text[mixed_start] == '\t') mixed_start++;
+    if (mixed_start != p->pos && number_can_start(p->text[mixed_start])) {
+        char *mixed_end = NULL;
+        double numerator = strtod(p->text + mixed_start, &mixed_end);
+        if (mixed_end != p->text + mixed_start) {
+            size_t after_numerator = (size_t)(mixed_end - p->text);
+            p->pos = after_numerator;
+            if (parse_fraction_tail(p, numerator, &fraction_value)) {
+                if (p->error[0] != '\0') return NAN;
+                return value < 0.0 ? value - fabs(fraction_value) : value + fraction_value;
+            }
+            p->pos = (size_t)(end - p->text);
+        }
+    }
+
     return value;
 }
 
@@ -1270,7 +1329,7 @@ static void draw_scientific_workspace(HDC hdc, RECT client) {
     SetBkMode(hdc, TRANSPARENT);
     TextOutW(hdc, panel.left + 24, panel.top + 24, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
-    const wchar_t *help = L"Type an expression or use the keypad, then press Calculate or Enter.";
+    const wchar_t *help = L"Type an expression, decimal, fraction, or mixed number, then press Calculate or Enter.";
     const wchar_t *functions = L"Supports ans, sin, cos, tan, asin, acos, atan, sqrt, log, ln, exp, abs, floor, ceil, pi, and e.";
     TextOutW(hdc, panel.left + 24, panel.top + 56, help, lstrlenW(help));
     TextOutW(hdc, panel.left + 24, panel.top + 88, functions, lstrlenW(functions));
