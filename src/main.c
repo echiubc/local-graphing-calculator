@@ -34,6 +34,10 @@
 #define ZOOM_IN_ID 1008
 #define ZOOM_OUT_ID 1009
 #define RESET_ID 1010
+#define MODE_GRAPH_ID 1011
+#define MODE_SCI_ID 1012
+#define SCI_CALC_ID 1013
+#define SCI_RESULT_ID 1014
 #define PAD_BASE_ID 2000
 #define MENU_RAD_ID 3001
 #define MENU_DEG_ID 3002
@@ -66,6 +70,8 @@ typedef struct {
 } Graph;
 
 typedef struct {
+    HWND graph_mode_button;
+    HWND scientific_mode_button;
     HWND input;
     HWND add_button;
     HWND update_button;
@@ -75,6 +81,8 @@ typedef struct {
     HWND zoom_in_button;
     HWND zoom_out_button;
     HWND reset_button;
+    HWND scientific_calc_button;
+    HWND scientific_result;
     HWND status;
     HWND pad_buttons[MAX_PAD_BUTTONS];
     int pad_count;
@@ -93,6 +101,7 @@ typedef struct {
     double scale;
     bool degrees;
     bool dark_mode;
+    bool scientific_mode;
     bool has_error;
     char error[160];
     bool hover_valid;
@@ -116,6 +125,15 @@ static const COLORREF DEFAULT_COLORS[] = {
     RGB(217, 119, 6),
     RGB(79, 70, 229)
 };
+
+static COLORREF next_distinct_default_color(COLORREF previous, int seed) {
+    int color_count = (int)(sizeof(DEFAULT_COLORS) / sizeof(DEFAULT_COLORS[0]));
+    for (int offset = 0; offset < color_count; offset++) {
+        COLORREF candidate = DEFAULT_COLORS[(seed + offset) % color_count];
+        if (candidate != previous) return candidate;
+    }
+    return DEFAULT_COLORS[0];
+}
 
 static ThemeColors theme(void) {
     if (g_app.dark_mode) {
@@ -384,6 +402,7 @@ static int world_to_screen_y(double y, RECT plot) {
 }
 
 static RECT plot_rect(HWND hwnd);
+static void read_input_expression(char *out, size_t out_size);
 
 static double screen_to_world_x(int sx, RECT plot) {
     return g_app.center_x + (sx - plot.left - (plot.right - plot.left) / 2.0) / g_app.scale;
@@ -450,14 +469,41 @@ static void update_status(void) {
     wchar_t text[512];
     if (g_app.has_error) {
         MultiByteToWideChar(CP_UTF8, 0, g_app.error, -1, text, (int)(sizeof(text) / sizeof(text[0])));
-    } else if (g_app.hover_valid) {
+    } else if (!g_app.scientific_mode && g_app.hover_valid) {
         MultiByteToWideChar(CP_UTF8, 0, g_app.hover_label, -1, text, (int)(sizeof(text) / sizeof(text[0])));
     } else {
-        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"%ls mode    %ls theme    Pan: arrows    Zoom: + / -",
-            g_app.degrees ? L"DEG" : L"RAD", g_app.dark_mode ? L"Dark" : L"Light");
+        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"%ls calculator    %ls angle    %ls theme%ls",
+            g_app.scientific_mode ? L"Scientific" : L"Graphing",
+            g_app.degrees ? L"DEG" : L"RAD",
+            g_app.dark_mode ? L"Dark" : L"Light",
+            g_app.scientific_mode ? L"" : L"    Pan: arrows    Zoom: + / -");
         text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
     }
     set_status_text(text);
+}
+
+static void calculate_scientific_result(void) {
+    char expr[512];
+    char error[160] = {0};
+    wchar_t text[256];
+    read_input_expression(expr, sizeof(expr));
+
+    double result = evaluate_expression(expr, 0.0, error, sizeof(error));
+    if (error[0] != '\0' || !isfinite(result)) {
+        if (error[0] == '\0') strcpy(error, "Result is undefined.");
+        MultiByteToWideChar(CP_UTF8, 0, error, -1, text, (int)(sizeof(text) / sizeof(text[0])));
+        g_app.has_error = true;
+        strncpy(g_app.error, error, sizeof(g_app.error) - 1);
+        g_app.error[sizeof(g_app.error) - 1] = '\0';
+    } else {
+        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"= %.15g", result);
+        text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
+        g_app.has_error = false;
+        g_app.error[0] = '\0';
+    }
+
+    SetWindowTextW(g_app.scientific_result, text);
+    update_status();
 }
 
 static void validate_graphs(void) {
@@ -496,10 +542,13 @@ static void add_graph_from_input(HWND hwnd) {
     strncpy(graph->expression, expr, sizeof(graph->expression) - 1);
     graph->expression[sizeof(graph->expression) - 1] = '\0';
     graph->color = g_app.next_color;
+    if (g_app.graph_count > 0 && graph->color == g_app.graphs[g_app.graph_count - 1].color) {
+        graph->color = next_distinct_default_color(g_app.graphs[g_app.graph_count - 1].color, g_app.graph_count);
+    }
     graph->visible = true;
     g_app.selected_graph = g_app.graph_count;
     g_app.graph_count++;
-    g_app.next_color = DEFAULT_COLORS[g_app.graph_count % (int)(sizeof(DEFAULT_COLORS) / sizeof(DEFAULT_COLORS[0]))];
+    g_app.next_color = next_distinct_default_color(graph->color, g_app.graph_count);
 
     refresh_graph_list();
     validate_graphs();
@@ -875,10 +924,31 @@ static void layout_controls(HWND hwnd) {
     int gap = 8;
     int y = margin;
 
+    int half = (sidebar_w - gap) / 2;
+    MoveWindow(g_app.graph_mode_button, margin, y, half, button_h, TRUE);
+    MoveWindow(g_app.scientific_mode_button, margin + half + gap, y, half, button_h, TRUE);
+    y += button_h + 12;
+
     MoveWindow(g_app.input, margin, y, sidebar_w, input_h, TRUE);
     y += input_h + gap;
 
-    int half = (sidebar_w - gap) / 2;
+    ShowWindow(g_app.add_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.update_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.remove_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.color_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.list, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.zoom_out_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.reset_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.zoom_in_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.scientific_calc_button, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.scientific_result, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
+
+    if (g_app.scientific_mode) {
+        MoveWindow(g_app.scientific_calc_button, margin, y, sidebar_w, button_h, TRUE);
+        y += button_h + gap;
+        MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 78, TRUE);
+        y += 78 + 18;
+    } else {
     MoveWindow(g_app.add_button, margin, y, half, button_h, TRUE);
     MoveWindow(g_app.update_button, margin + half + gap, y, half, button_h, TRUE);
     y += button_h + gap;
@@ -894,6 +964,7 @@ static void layout_controls(HWND hwnd) {
     MoveWindow(g_app.reset_button, margin + third + gap, y, third, button_h, TRUE);
     MoveWindow(g_app.zoom_in_button, margin + (third + gap) * 2, y, third, button_h, TRUE);
     y += button_h + 12;
+    }
 
     int cols = 5;
     int pad_gap = 6;
@@ -932,6 +1003,8 @@ static void create_keypad(HWND hwnd) {
 }
 
 static void apply_control_fonts(void) {
+    SendMessageW(g_app.graph_mode_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.scientific_mode_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.input, WM_SETFONT, (WPARAM)g_app.mono_font, TRUE);
     SendMessageW(g_app.add_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.update_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
@@ -941,6 +1014,8 @@ static void apply_control_fonts(void) {
     SendMessageW(g_app.zoom_in_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.zoom_out_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.reset_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.scientific_calc_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.scientific_result, WM_SETFONT, (WPARAM)g_app.mono_font, TRUE);
     SendMessageW(g_app.status, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
 }
 
@@ -972,9 +1047,36 @@ static void draw_sidebar(HDC hdc, RECT client) {
     HFONT old_font = SelectObject(hdc, g_app.ui_font);
     SetTextColor(hdc, c.muted);
     SetBkMode(hdc, TRANSPARENT);
-    TextOutW(hdc, 18, 326, L"Keys", 4);
-    TextOutW(hdc, 18, 14 + 32 + 8 + 30 + 8 + 30 + 8 - 18, L"Graphs", 6);
+    TextOutW(hdc, 18, g_app.scientific_mode ? 184 : 368, L"Keys", 4);
+    if (g_app.scientific_mode) {
+        TextOutW(hdc, 18, 94, L"Result", 6);
+    } else {
+        TextOutW(hdc, 18, 14 + 30 + 12 + 32 + 8 + 30 + 8 + 30 + 8 - 18, L"Graphs", 6);
+    }
     SelectObject(hdc, old_font);
+}
+
+static void draw_scientific_workspace(HDC hdc, RECT client) {
+    ThemeColors c = theme();
+    RECT panel = {300, 68, client.right - 18, client.bottom - 54};
+    HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
+    HBRUSH old_brush = SelectObject(hdc, g_app.panel_bg_brush);
+    HPEN old_pen = SelectObject(hdc, border_pen);
+    RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 14, 14);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+
+    HFONT old_font = SelectObject(hdc, g_app.ui_font);
+    SetTextColor(hdc, c.text);
+    SetBkMode(hdc, TRANSPARENT);
+    TextOutW(hdc, panel.left + 24, panel.top + 24, L"Scientific Calculator", 21);
+    SetTextColor(hdc, c.muted);
+    const wchar_t *help = L"Type an expression or use the keypad, then press Calculate or Enter.";
+    const wchar_t *functions = L"Supports sin, cos, tan, asin, acos, atan, sqrt, log, ln, exp, abs, floor, ceil, pi, and e.";
+    TextOutW(hdc, panel.left + 24, panel.top + 56, help, lstrlenW(help));
+    TextOutW(hdc, panel.left + 24, panel.top + 88, functions, lstrlenW(functions));
+    SelectObject(hdc, old_font);
+    DeleteObject(border_pen);
 }
 
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -990,10 +1092,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.next_color = DEFAULT_COLORS[0];
         g_app.degrees = false;
         g_app.dark_mode = false;
+        g_app.scientific_mode = false;
 
         SetMenu(hwnd, create_app_menu());
         update_menu_checks(hwnd);
 
+        g_app.graph_mode_button = create_button(hwnd, L"Graphing", MODE_GRAPH_ID);
+        g_app.scientific_mode_button = create_button(hwnd, L"Scientific", MODE_SCI_ID);
         g_app.input = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"sin(x)",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)INPUT_ID, GetModuleHandleW(NULL), NULL);
@@ -1007,6 +1112,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.zoom_out_button = create_button(hwnd, L"-", ZOOM_OUT_ID);
         g_app.reset_button = create_button(hwnd, L"Reset", RESET_ID);
         g_app.zoom_in_button = create_button(hwnd, L"+", ZOOM_IN_ID);
+        g_app.scientific_calc_button = create_button(hwnd, L"Calculate", SCI_CALC_ID);
+        g_app.scientific_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"= ",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 0, 0, hwnd, (HMENU)SCI_RESULT_ID, GetModuleHandleW(NULL), NULL);
         g_app.status = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)STATUS_ID, GetModuleHandleW(NULL), NULL);
         create_keypad(hwnd);
@@ -1027,7 +1136,21 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_COMMAND: {
         int id = LOWORD(wparam);
-        if (id == ADD_ID) add_graph_from_input(hwnd);
+        if (id == MODE_GRAPH_ID || id == MODE_SCI_ID) {
+            g_app.scientific_mode = id == MODE_SCI_ID;
+            g_app.hover_valid = false;
+            g_app.has_error = false;
+            g_app.error[0] = '\0';
+            if (!g_app.scientific_mode) {
+                set_input_from_graph(g_app.selected_graph);
+            }
+            layout_controls(hwnd);
+            update_status();
+            InvalidateRect(hwnd, NULL, TRUE);
+        } else if (id == SCI_CALC_ID) {
+            calculate_scientific_result();
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (id == ADD_ID) add_graph_from_input(hwnd);
         else if (id == UPDATE_ID) update_selected_graph(hwnd);
         else if (id == REMOVE_ID) remove_selected_graph(hwnd);
         else if (id == COLOR_ID) choose_graph_color(hwnd);
@@ -1050,8 +1173,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             int index = id - PAD_BASE_ID;
             wchar_t text[64];
             GetWindowTextW(g_app.pad_buttons[index], text, (int)(sizeof(text) / sizeof(text[0])));
-            if (wcscmp(text, L"Clear") == 0) SetWindowTextW(g_app.input, L"");
-            else append_to_input(text);
+            if (wcscmp(text, L"Clear") == 0) {
+                SetWindowTextW(g_app.input, L"");
+                if (g_app.scientific_mode) SetWindowTextW(g_app.scientific_result, L"= ");
+            } else {
+                append_to_input(text);
+            }
         } else if (id == MENU_RAD_ID || id == MENU_DEG_ID) {
             g_app.degrees = id == MENU_DEG_ID;
             update_menu_checks(hwnd);
@@ -1085,11 +1212,16 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_CTLCOLORSTATIC: {
         ThemeColors c = theme();
         SetTextColor((HDC)wparam, g_app.has_error ? c.error : c.muted);
+        if ((HWND)lparam == g_app.scientific_result) {
+            SetBkColor((HDC)wparam, c.panel_bg);
+            return (LRESULT)g_app.control_bg_brush;
+        }
         SetBkColor((HDC)wparam, c.app_bg);
         return (LRESULT)g_app.app_bg_brush;
     }
 
     case WM_MOUSEMOVE:
+        if (g_app.scientific_mode) return 0;
         {
             TRACKMOUSEEVENT track = {0};
             track.cbSize = sizeof(track);
@@ -1110,6 +1242,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_KEYDOWN:
         switch (wparam) {
+        case VK_RETURN:
+            if (g_app.scientific_mode) {
+                calculate_scientific_result();
+                return 0;
+            }
+            return 0;
         case VK_LEFT: g_app.center_x -= 30.0 / g_app.scale; break;
         case VK_RIGHT: g_app.center_x += 30.0 / g_app.scale; break;
         case VK_UP: g_app.center_y += 30.0 / g_app.scale; break;
@@ -1144,31 +1282,35 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         FillRect(hdc, &client, g_app.app_bg_brush);
         draw_sidebar(hdc, client);
 
-        RECT plot = plot_rect(hwnd);
-        HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
-        HBRUSH old_brush = SelectObject(hdc, g_app.panel_bg_brush);
-        HPEN old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
+        if (g_app.scientific_mode) {
+            draw_scientific_workspace(hdc, client);
+        } else {
+            RECT plot = plot_rect(hwnd);
+            HPEN border_pen = CreatePen(PS_SOLID, 1, c.panel_border);
+            HBRUSH old_brush = SelectObject(hdc, g_app.panel_bg_brush);
+            HPEN old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
 
-        HRGN plot_region = CreateRoundRectRgn(plot.left + 1, plot.top + 1, plot.right, plot.bottom, 14, 14);
-        SelectClipRgn(hdc, plot_region);
-        g_app.has_error = false;
-        draw_grid(hdc, plot);
-        for (int i = 0; i < g_app.graph_count; i++) {
-            draw_graph(hdc, plot, i);
+            HRGN plot_region = CreateRoundRectRgn(plot.left + 1, plot.top + 1, plot.right, plot.bottom, 14, 14);
+            SelectClipRgn(hdc, plot_region);
+            g_app.has_error = false;
+            draw_grid(hdc, plot);
+            for (int i = 0; i < g_app.graph_count; i++) {
+                draw_graph(hdc, plot, i);
+            }
+            draw_hover(hdc, plot);
+            SelectClipRgn(hdc, NULL);
+            DeleteObject(plot_region);
+
+            old_pen = SelectObject(hdc, border_pen);
+            old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            DeleteObject(border_pen);
         }
-        draw_hover(hdc, plot);
-        SelectClipRgn(hdc, NULL);
-        DeleteObject(plot_region);
-
-        old_pen = SelectObject(hdc, border_pen);
-        old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        RoundRect(hdc, plot.left, plot.top, plot.right, plot.bottom, 14, 14);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        DeleteObject(border_pen);
 
         BitBlt(paint_dc, 0, 0, client.right - client.left, client.bottom - client.top, buffer_dc, 0, 0, SRCCOPY);
         SelectObject(buffer_dc, old_bitmap);
