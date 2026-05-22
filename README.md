@@ -2,6 +2,8 @@
 
 A small Windows graphing calculator written in C. It uses the Win32 API directly, so it does not need SDL, Qt, or any other runtime dependency.
 
+Note: This project is just me playing around with OpenAI Codex.
+
 ## Features
 
 - Type a function of `x` and draw it locally.
