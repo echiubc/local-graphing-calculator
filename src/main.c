@@ -1247,6 +1247,25 @@ static void fit_bounds_to_plot(HWND hwnd, double min_x, double max_x, double min
     g_app.scale = new_scale;
 }
 
+static bool bounds_are_too_small_for_plot(RECT plot, double min_x, double max_x, double min_y, double max_y) {
+    double visible_width = screen_to_world_x(plot.right, plot) - screen_to_world_x(plot.left, plot);
+    double visible_height = screen_to_world_y(plot.top, plot) - screen_to_world_y(plot.bottom, plot);
+    double graph_width = max_x - min_x;
+    double graph_height = max_y - min_y;
+    if (visible_width <= 0.0 || visible_height <= 0.0 || graph_width < 0.0 || graph_height < 0.0) return false;
+    return graph_width < visible_width * 0.08 || graph_height < visible_height * 0.08;
+}
+
+static void widen_tiny_bounds(double *min_value, double *max_value) {
+    double midpoint = (*min_value + *max_value) * 0.5;
+    double height = *max_value - *min_value;
+    double magnitude = fmax(fabs(*min_value), fabs(*max_value));
+    double min_height = fmax(magnitude * 0.25, 0.000001);
+    if (height >= min_height) return;
+    *min_value = midpoint - min_height * 0.5;
+    *max_value = midpoint + min_height * 0.5;
+}
+
 static void auto_fit_function_graph(HWND hwnd, Graph *graph) {
     RECT plot = plot_rect(hwnd);
     double left = screen_to_world_x(plot.left, plot);
@@ -1272,13 +1291,21 @@ static void auto_fit_function_graph(HWND hwnd, Graph *graph) {
     if (!has_point) return;
     double visible_bottom = screen_to_world_y(plot.bottom, plot);
     double visible_top = screen_to_world_y(plot.top, plot);
-    if (min_y >= visible_bottom && max_y <= visible_top) return;
+    bool already_visible = min_y >= visible_bottom && max_y <= visible_top;
+    bool too_small = bounds_are_too_small_for_plot(plot, left, right, min_y, max_y);
+    if (already_visible && !too_small) return;
 
-    if (fabs(max_y - min_y) < 1e-9) {
-        min_y -= 1.0;
-        max_y += 1.0;
+    widen_tiny_bounds(&min_y, &max_y);
+    if (too_small) {
+        double padded_height = (max_y - min_y) * 1.15;
+        double new_scale = (plot.bottom - plot.top) / padded_height;
+        if (isfinite(new_scale) && new_scale > 1.0) {
+            g_app.center_y = (min_y + max_y) * 0.5;
+            g_app.scale = new_scale;
+        }
+    } else {
+        fit_bounds_to_plot(hwnd, left, right, min_y, max_y);
     }
-    fit_bounds_to_plot(hwnd, left, right, min_y, max_y);
 }
 
 static bool implicit_crosses_cell(double f00, double f10, double f01, double f11) {
@@ -1336,7 +1363,11 @@ static void auto_fit_implicit_graph(HWND hwnd, Graph *graph) {
             double visible_right = screen_to_world_x(plot.right, plot);
             double visible_bottom = screen_to_world_y(plot.bottom, plot);
             double visible_top = screen_to_world_y(plot.top, plot);
-            if (min_x >= visible_left && max_x <= visible_right && min_y >= visible_bottom && max_y <= visible_top) return;
+            bool already_visible = min_x >= visible_left && max_x <= visible_right && min_y >= visible_bottom && max_y <= visible_top;
+            bool too_small = bounds_are_too_small_for_plot(plot, min_x, max_x, min_y, max_y);
+            if (already_visible && !too_small) return;
+            widen_tiny_bounds(&min_x, &max_x);
+            widen_tiny_bounds(&min_y, &max_y);
             fit_bounds_to_plot(hwnd, min_x, max_x, min_y, max_y);
             return;
         }
