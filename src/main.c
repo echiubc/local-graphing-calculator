@@ -22,7 +22,7 @@
 
 #define APP_CLASS_NAME L"LocalGraphingCalculatorWindow"
 #define MAX_GRAPHS 32
-#define MAX_PAD_BUTTONS 30
+#define MAX_PAD_BUTTONS 35
 
 #define INPUT_ID 1001
 #define ADD_ID 1002
@@ -38,6 +38,9 @@
 #define MODE_SCI_ID 1012
 #define SCI_CALC_ID 1013
 #define SCI_RESULT_ID 1014
+#define SAVE_GRAPHS_ID 1015
+#define IMPORT_GRAPHS_ID 1016
+#define SCI_HISTORY_ID 1017
 #define PAD_BASE_ID 2000
 #define MENU_RAD_ID 3001
 #define MENU_DEG_ID 3002
@@ -70,6 +73,14 @@ typedef struct {
 } Graph;
 
 typedef struct {
+    char expression[512];
+    char result[64];
+} Calculation;
+
+// AppState owns every live Win32 handle and all user-facing calculator state.
+// Keeping it centralized makes the two modes share parser/settings behavior
+// without passing a large context through every window callback.
+typedef struct {
     HWND graph_mode_button;
     HWND scientific_mode_button;
     HWND input;
@@ -77,12 +88,15 @@ typedef struct {
     HWND update_button;
     HWND remove_button;
     HWND color_button;
+    HWND save_graphs_button;
+    HWND import_graphs_button;
     HWND list;
     HWND zoom_in_button;
     HWND zoom_out_button;
     HWND reset_button;
     HWND scientific_calc_button;
     HWND scientific_result;
+    HWND scientific_history;
     HWND status;
     HWND pad_buttons[MAX_PAD_BUTTONS];
     int pad_count;
@@ -93,15 +107,19 @@ typedef struct {
     HBRUSH panel_bg_brush;
     HBRUSH control_bg_brush;
     Graph graphs[MAX_GRAPHS];
+    Calculation calculations[128];
     int graph_count;
     int selected_graph;
+    int calculation_count;
     COLORREF next_color;
+    double last_answer;
     double center_x;
     double center_y;
     double scale;
     bool degrees;
     bool dark_mode;
     bool scientific_mode;
+    bool has_answer;
     bool has_error;
     char error[160];
     bool hover_valid;
@@ -307,6 +325,11 @@ static double parse_primary(Parser *p) {
     }
 
     if (match_word(p, "x")) return p->x;
+    if (match_word(p, "ans")) {
+        if (g_app.has_answer) return g_app.last_answer;
+        set_error(p, "No previous answer is saved yet.");
+        return NAN;
+    }
     if (match_word(p, "pi")) return M_PI;
     if (match_word(p, "e")) return exp(1.0);
 
@@ -403,6 +426,9 @@ static int world_to_screen_y(double y, RECT plot) {
 
 static RECT plot_rect(HWND hwnd);
 static void read_input_expression(char *out, size_t out_size);
+static void append_to_input(const wchar_t *text);
+static void update_menu_checks(HWND hwnd);
+FILE *_wfopen(const wchar_t *filename, const wchar_t *mode);
 
 static double screen_to_world_x(int sx, RECT plot) {
     return g_app.center_x + (sx - plot.left - (plot.right - plot.left) / 2.0) / g_app.scale;
@@ -450,6 +476,50 @@ static void refresh_graph_list(void) {
     }
 }
 
+// Scientific history stores the formatted full-precision result separately from
+// the display label so double-click reuse does not depend on parsing UI text.
+static void refresh_calculation_history(void) {
+    SendMessageW(g_app.scientific_history, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < g_app.calculation_count; i++) {
+        wchar_t expr[512];
+        wchar_t result[80];
+        wchar_t label[640];
+        MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[i].expression, -1, expr, (int)(sizeof(expr) / sizeof(expr[0])));
+        MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[i].result, -1, result, (int)(sizeof(result) / sizeof(result[0])));
+        _snwprintf(label, sizeof(label) / sizeof(label[0]), L"%ls = %ls", expr, result);
+        label[(sizeof(label) / sizeof(label[0])) - 1] = L'\0';
+        SendMessageW(g_app.scientific_history, LB_ADDSTRING, 0, (LPARAM)label);
+    }
+    SendMessageW(g_app.scientific_history, LB_SETHORIZONTALEXTENT, 1200, 0);
+    if (g_app.calculation_count > 0) {
+        SendMessageW(g_app.scientific_history, LB_SETCURSEL, (WPARAM)(g_app.calculation_count - 1), 0);
+    }
+}
+
+static void add_calculation_history(const char *expr, const char *result) {
+    if (expr[0] == '\0' || result[0] == '\0') return;
+    // Keep the history bounded; older calculations fall off once the sidebar is full.
+    if (g_app.calculation_count == (int)(sizeof(g_app.calculations) / sizeof(g_app.calculations[0]))) {
+        memmove(g_app.calculations, g_app.calculations + 1, sizeof(g_app.calculations) - sizeof(g_app.calculations[0]));
+        g_app.calculation_count--;
+    }
+    Calculation *calc = &g_app.calculations[g_app.calculation_count++];
+    strncpy(calc->expression, expr, sizeof(calc->expression) - 1);
+    calc->expression[sizeof(calc->expression) - 1] = '\0';
+    strncpy(calc->result, result, sizeof(calc->result) - 1);
+    calc->result[sizeof(calc->result) - 1] = '\0';
+    refresh_calculation_history();
+}
+
+static void reuse_selected_calculation_result(void) {
+    int selected = (int)SendMessageW(g_app.scientific_history, LB_GETCURSEL, 0, 0);
+    if (selected < 0 || selected >= g_app.calculation_count) return;
+
+    wchar_t result[80];
+    MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[selected].result, -1, result, (int)(sizeof(result) / sizeof(result[0])));
+    append_to_input(result);
+}
+
 static void set_input_from_graph(int index) {
     if (index < 0 || index >= g_app.graph_count) return;
     wchar_t wide[512];
@@ -485,6 +555,7 @@ static void update_status(void) {
 static void calculate_scientific_result(void) {
     char expr[512];
     char error[160] = {0};
+    char result_text[64] = {0};
     wchar_t text[256];
     read_input_expression(expr, sizeof(expr));
 
@@ -496,10 +567,15 @@ static void calculate_scientific_result(void) {
         strncpy(g_app.error, error, sizeof(g_app.error) - 1);
         g_app.error[sizeof(g_app.error) - 1] = '\0';
     } else {
-        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"= %.15g", result);
+        // %.17g is enough to round-trip a double for follow-up calculations.
+        snprintf(result_text, sizeof(result_text), "%.17g", result);
+        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"= %.17g", result);
         text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
+        g_app.last_answer = result;
+        g_app.has_answer = true;
         g_app.has_error = false;
         g_app.error[0] = '\0';
+        add_calculation_history(expr, result_text);
     }
 
     SetWindowTextW(g_app.scientific_result, text);
@@ -618,6 +694,111 @@ static void choose_graph_color(HWND hwnd) {
     }
 }
 
+static bool choose_graph_file(HWND hwnd, wchar_t *path, DWORD path_len, bool saving) {
+    OPENFILENAMEW ofn = {0};
+    path[0] = L'\0';
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = L"Graph Sets (*.lgc)\0*.lgc\0Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = path_len;
+    ofn.lpstrDefExt = L"lgc";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (saving ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    return saving ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
+}
+
+static void save_graphs(HWND hwnd) {
+    wchar_t path[MAX_PATH];
+    if (!choose_graph_file(hwnd, path, (DWORD)(sizeof(path) / sizeof(path[0])), true)) return;
+
+    FILE *file = _wfopen(path, L"w");
+    if (!file) {
+        MessageBoxW(hwnd, L"Could not save the graph file.", L"Save Graphs", MB_ICONERROR);
+        return;
+    }
+
+    // .lgc files are plain text on purpose: version header first, viewport
+    // settings next, then one graph record per expression/color pair.
+    fprintf(file, "LGC_GRAPHS_V1\n");
+    fprintf(file, "center %.17g %.17g\n", g_app.center_x, g_app.center_y);
+    fprintf(file, "scale %.17g\n", g_app.scale);
+    fprintf(file, "angle %s\n", g_app.degrees ? "DEG" : "RAD");
+    fprintf(file, "graphs %d\n", g_app.graph_count);
+    for (int i = 0; i < g_app.graph_count; i++) {
+        Graph *graph = &g_app.graphs[i];
+        fprintf(file, "graph %lu %d %s\n", (unsigned long)graph->color, graph->visible ? 1 : 0, graph->expression);
+    }
+    fclose(file);
+}
+
+static void import_graphs(HWND hwnd) {
+    wchar_t path[MAX_PATH];
+    if (!choose_graph_file(hwnd, path, (DWORD)(sizeof(path) / sizeof(path[0])), false)) return;
+
+    FILE *file = _wfopen(path, L"r");
+    if (!file) {
+        MessageBoxW(hwnd, L"Could not open the graph file.", L"Import Graphs", MB_ICONERROR);
+        return;
+    }
+
+    char line[768];
+    Graph imported[MAX_GRAPHS];
+    int imported_count = 0;
+    double center_x = g_app.center_x;
+    double center_y = g_app.center_y;
+    double scale = g_app.scale;
+    bool degrees = g_app.degrees;
+
+    if (!fgets(line, sizeof(line), file) || strncmp(line, "LGC_GRAPHS_V1", 13) != 0) {
+        fclose(file);
+        MessageBoxW(hwnd, L"This does not look like a saved graph file.", L"Import Graphs", MB_ICONERROR);
+        return;
+    }
+
+    // Unknown lines are ignored so future versions can add optional metadata.
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "center ", 7) == 0) {
+            sscanf(line + 7, "%lf %lf", &center_x, &center_y);
+        } else if (strncmp(line, "scale ", 6) == 0) {
+            sscanf(line + 6, "%lf", &scale);
+        } else if (strncmp(line, "angle ", 6) == 0) {
+            degrees = strstr(line + 6, "DEG") != NULL;
+        } else if (strncmp(line, "graph ", 6) == 0 && imported_count < MAX_GRAPHS) {
+            unsigned long color = 0;
+            int visible = 1;
+            char expr[512] = {0};
+            if (sscanf(line + 6, "%lu %d %511[^\n]", &color, &visible, expr) == 3 && expr[0] != '\0') {
+                Graph *graph = &imported[imported_count++];
+                strncpy(graph->expression, expr, sizeof(graph->expression) - 1);
+                graph->expression[sizeof(graph->expression) - 1] = '\0';
+                graph->color = (COLORREF)color;
+                graph->visible = visible != 0;
+            }
+        }
+    }
+    fclose(file);
+
+    if (imported_count == 0) {
+        MessageBoxW(hwnd, L"No graphs were found in that file.", L"Import Graphs", MB_ICONWARNING);
+        return;
+    }
+
+    memcpy(g_app.graphs, imported, sizeof(Graph) * imported_count);
+    g_app.graph_count = imported_count;
+    g_app.selected_graph = 0;
+    g_app.center_x = center_x;
+    g_app.center_y = center_y;
+    if (scale > 1.0) g_app.scale = scale;
+    g_app.degrees = degrees;
+    g_app.next_color = next_distinct_default_color(g_app.graphs[g_app.graph_count - 1].color, g_app.graph_count);
+    set_input_from_graph(g_app.selected_graph);
+    refresh_graph_list();
+    validate_graphs();
+    update_menu_checks(hwnd);
+    update_status();
+    InvalidateRect(hwnd, NULL, TRUE);
+}
+
 static void invalidate_plot(HWND hwnd) {
     RECT plot = plot_rect(hwnd);
     InflateRect(&plot, 2, 2);
@@ -732,6 +913,7 @@ static bool refine_root(const char *expr, double left, double right, double *roo
     }
     if ((fl > 0 && fr > 0) || (fl < 0 && fr < 0)) return false;
 
+    // Bisection is slower than Newton's method but stable for hover snapping.
     for (int i = 0; i < 48; i++) {
         double mid = (left + right) * 0.5;
         double fm = evaluate_expression(expr, mid, error, sizeof(error));
@@ -754,6 +936,8 @@ static bool refine_root(const char *expr, double left, double right, double *roo
 static void update_hover(HWND hwnd, int mx, int my) {
     RECT plot = plot_rect(hwnd);
 
+    // Track the old hover target so mouse movement only repaints the graph
+    // panel when the displayed marker actually changes.
     bool old_hover_valid = g_app.hover_valid;
     int old_hover_graph = g_app.hover_graph;
     double old_hover_x = g_app.hover_x;
@@ -936,18 +1120,25 @@ static void layout_controls(HWND hwnd) {
     ShowWindow(g_app.update_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.remove_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.color_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.save_graphs_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app.import_graphs_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.list, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.zoom_out_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.reset_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.zoom_in_button, g_app.scientific_mode ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app.scientific_calc_button, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.scientific_result, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.scientific_history, g_app.scientific_mode ? SW_SHOW : SW_HIDE);
 
+    // The left rail is mode-aware: graph mode shows graph management controls,
+    // scientific mode swaps that area for result and history controls.
     if (g_app.scientific_mode) {
         MoveWindow(g_app.scientific_calc_button, margin, y, sidebar_w, button_h, TRUE);
         y += button_h + gap;
-        MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 78, TRUE);
-        y += 78 + 18;
+        MoveWindow(g_app.scientific_result, margin, y, sidebar_w, 48, TRUE);
+        y += 48 + gap + 20;
+        MoveWindow(g_app.scientific_history, margin, y, sidebar_w, 158, TRUE);
+        y += 158 + 18;
     } else {
     MoveWindow(g_app.add_button, margin, y, half, button_h, TRUE);
     MoveWindow(g_app.update_button, margin + half + gap, y, half, button_h, TRUE);
@@ -955,9 +1146,12 @@ static void layout_controls(HWND hwnd) {
     MoveWindow(g_app.remove_button, margin, y, half, button_h, TRUE);
     MoveWindow(g_app.color_button, margin + half + gap, y, half, button_h, TRUE);
     y += button_h + gap;
+    MoveWindow(g_app.save_graphs_button, margin, y, half, button_h, TRUE);
+    MoveWindow(g_app.import_graphs_button, margin + half + gap, y, half, button_h, TRUE);
+    y += button_h + gap;
 
-    MoveWindow(g_app.list, margin, y, sidebar_w, 148, TRUE);
-    y += 148 + gap;
+    MoveWindow(g_app.list, margin, y, sidebar_w, 118, TRUE);
+    y += 118 + gap;
 
     int third = (sidebar_w - gap * 2) / 3;
     MoveWindow(g_app.zoom_out_button, margin, y, third, button_h, TRUE);
@@ -993,7 +1187,8 @@ static void create_keypad(HWND hwnd) {
         L"1", L"2", L"3", L"-", L"tan(",
         L"0", L".", L"x", L"+", L"sqrt(",
         L"(", L")", L"^", L"pi", L"log(",
-        L"ln(", L"abs(", L"exp(", L"e", L"Clear"
+        L"ln(", L"abs(", L"exp(", L"e", L"ans",
+        L"floor(", L"ceil(", L"asin(", L"acos(", L"Clear"
     };
 
     g_app.pad_count = (int)(sizeof(labels) / sizeof(labels[0]));
@@ -1010,12 +1205,15 @@ static void apply_control_fonts(void) {
     SendMessageW(g_app.update_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.remove_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.color_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.save_graphs_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
+    SendMessageW(g_app.import_graphs_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.list, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.zoom_in_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.zoom_out_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.reset_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.scientific_calc_button, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.scientific_result, WM_SETFONT, (WPARAM)g_app.mono_font, TRUE);
+    SendMessageW(g_app.scientific_history, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
     SendMessageW(g_app.status, WM_SETFONT, (WPARAM)g_app.ui_font, TRUE);
 }
 
@@ -1047,11 +1245,12 @@ static void draw_sidebar(HDC hdc, RECT client) {
     HFONT old_font = SelectObject(hdc, g_app.ui_font);
     SetTextColor(hdc, c.muted);
     SetBkMode(hdc, TRANSPARENT);
-    TextOutW(hdc, 18, g_app.scientific_mode ? 184 : 368, L"Keys", 4);
+    TextOutW(hdc, 18, g_app.scientific_mode ? 360 : 398, L"Keys", 4);
     if (g_app.scientific_mode) {
         TextOutW(hdc, 18, 94, L"Result", 6);
+        TextOutW(hdc, 18, 196, L"History", 7);
     } else {
-        TextOutW(hdc, 18, 14 + 30 + 12 + 32 + 8 + 30 + 8 + 30 + 8 - 18, L"Graphs", 6);
+        TextOutW(hdc, 18, 14 + 30 + 12 + 32 + 8 + 30 + 8 + 30 + 8 + 30 + 8 - 18, L"Graphs", 6);
     }
     SelectObject(hdc, old_font);
 }
@@ -1072,7 +1271,7 @@ static void draw_scientific_workspace(HDC hdc, RECT client) {
     TextOutW(hdc, panel.left + 24, panel.top + 24, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
     const wchar_t *help = L"Type an expression or use the keypad, then press Calculate or Enter.";
-    const wchar_t *functions = L"Supports sin, cos, tan, asin, acos, atan, sqrt, log, ln, exp, abs, floor, ceil, pi, and e.";
+    const wchar_t *functions = L"Supports ans, sin, cos, tan, asin, acos, atan, sqrt, log, ln, exp, abs, floor, ceil, pi, and e.";
     TextOutW(hdc, panel.left + 24, panel.top + 56, help, lstrlenW(help));
     TextOutW(hdc, panel.left + 24, panel.top + 88, functions, lstrlenW(functions));
     SelectObject(hdc, old_font);
@@ -1106,6 +1305,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.update_button = create_button(hwnd, L"Save edit", UPDATE_ID);
         g_app.remove_button = create_button(hwnd, L"Remove", REMOVE_ID);
         g_app.color_button = create_button(hwnd, L"Color", COLOR_ID);
+        g_app.save_graphs_button = create_button(hwnd, L"Save set", SAVE_GRAPHS_ID);
+        g_app.import_graphs_button = create_button(hwnd, L"Import", IMPORT_GRAPHS_ID);
         g_app.list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)LIST_ID, GetModuleHandleW(NULL), NULL);
@@ -1116,6 +1317,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.scientific_result = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"= ",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             0, 0, 0, 0, hwnd, (HMENU)SCI_RESULT_ID, GetModuleHandleW(NULL), NULL);
+        g_app.scientific_history = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)SCI_HISTORY_ID, GetModuleHandleW(NULL), NULL);
         g_app.status = CreateWindowW(L"STATIC", L"",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)STATUS_ID, GetModuleHandleW(NULL), NULL);
         create_keypad(hwnd);
@@ -1150,6 +1354,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         } else if (id == SCI_CALC_ID) {
             calculate_scientific_result();
             InvalidateRect(hwnd, NULL, FALSE);
+        } else if (id == SAVE_GRAPHS_ID) {
+            save_graphs(hwnd);
+        } else if (id == IMPORT_GRAPHS_ID) {
+            import_graphs(hwnd);
         } else if (id == ADD_ID) add_graph_from_input(hwnd);
         else if (id == UPDATE_ID) update_selected_graph(hwnd);
         else if (id == REMOVE_ID) remove_selected_graph(hwnd);
@@ -1169,6 +1377,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             g_app.selected_graph = (int)SendMessageW(g_app.list, LB_GETCURSEL, 0, 0);
             set_input_from_graph(g_app.selected_graph);
             InvalidateRect(hwnd, NULL, TRUE);
+        } else if (id == SCI_HISTORY_ID && HIWORD(wparam) == LBN_DBLCLK) {
+            reuse_selected_calculation_result();
         } else if (id >= PAD_BASE_ID && id < PAD_BASE_ID + g_app.pad_count) {
             int index = id - PAD_BASE_ID;
             wchar_t text[64];
@@ -1272,6 +1482,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT client;
         GetClientRect(hwnd, &client);
+        // Paint into an off-screen bitmap first; direct GDI painting flickers
+        // badly when hover tracking causes frequent plot updates.
         HDC paint_dc = hdc;
         HDC buffer_dc = CreateCompatibleDC(paint_dc);
         HBITMAP buffer_bitmap = CreateCompatibleBitmap(paint_dc, client.right - client.left, client.bottom - client.top);
