@@ -46,6 +46,8 @@
 #define MENU_DEG_ID 3002
 #define MENU_LIGHT_ID 3003
 #define MENU_DARK_ID 3004
+#define MENU_DECIMAL_OUTPUT_ID 3005
+#define MENU_FRACTION_OUTPUT_ID 3006
 
 typedef struct {
     COLORREF app_bg;
@@ -119,6 +121,7 @@ typedef struct {
     bool degrees;
     bool dark_mode;
     bool scientific_mode;
+    bool scientific_fraction_output;
     bool has_answer;
     bool has_error;
     char error[160];
@@ -489,6 +492,83 @@ static void append_to_input(const wchar_t *text);
 static void update_menu_checks(HWND hwnd);
 FILE *_wfopen(const wchar_t *filename, const wchar_t *mode);
 
+static long long gcd_ll(long long a, long long b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b != 0) {
+        long long t = a % b;
+        a = b;
+        b = t;
+    }
+    return a == 0 ? 1 : a;
+}
+
+static bool decimal_to_fraction(double value, long long *numerator, long long *denominator) {
+    const long long max_denominator = 1000000;
+    const double tolerance = 1e-12;
+    if (!isfinite(value)) return false;
+
+    int sign = value < 0.0 ? -1 : 1;
+    double x = fabs(value);
+    long long a = (long long)floor(x);
+    long long n0 = 0, d0 = 1;
+    long long n1 = 1, d1 = 0;
+
+    for (int i = 0; i < 32; i++) {
+        long long n2 = a * n1 + n0;
+        long long d2 = a * d1 + d0;
+        if (d2 > max_denominator) break;
+
+        n0 = n1;
+        d0 = d1;
+        n1 = n2;
+        d1 = d2;
+
+        double approximation = (double)n1 / (double)d1;
+        if (fabs(approximation - x) <= tolerance) break;
+
+        double fractional = x - floor(x);
+        if (fractional <= tolerance) break;
+        x = 1.0 / fractional;
+        a = (long long)floor(x);
+    }
+
+    long long divisor = gcd_ll(n1, d1);
+    *numerator = sign * (n1 / divisor);
+    *denominator = d1 / divisor;
+    return *denominator != 0;
+}
+
+static void format_scientific_result(double result, char *out, size_t out_size) {
+    if (g_app.scientific_fraction_output) {
+        long long numerator = 0;
+        long long denominator = 1;
+        if (decimal_to_fraction(result, &numerator, &denominator)) {
+            if (denominator == 1) snprintf(out, out_size, "%I64d", numerator);
+            else snprintf(out, out_size, "%I64d/%I64d", numerator, denominator);
+            return;
+        }
+    }
+    snprintf(out, out_size, "%.17g", result);
+}
+
+static void update_scientific_result_display(void) {
+    wchar_t text[256];
+    if (!g_app.has_answer) {
+        SetWindowTextW(g_app.scientific_result, L"= ");
+        return;
+    }
+
+    char result_text[96];
+    format_scientific_result(g_app.last_answer, result_text, sizeof(result_text));
+    MultiByteToWideChar(CP_UTF8, 0, result_text, -1, text, (int)(sizeof(text) / sizeof(text[0])));
+
+    wchar_t label[280];
+    _snwprintf(label, sizeof(label) / sizeof(label[0]), L"= %ls", text);
+    label[(sizeof(label) / sizeof(label[0])) - 1] = L'\0';
+    SetWindowTextW(g_app.scientific_result, label);
+}
+
 static double screen_to_world_x(int sx, RECT plot) {
     return g_app.center_x + (sx - plot.left - (plot.right - plot.left) / 2.0) / g_app.scale;
 }
@@ -543,8 +623,10 @@ static void refresh_calculation_history(void) {
         wchar_t expr[512];
         wchar_t result[80];
         wchar_t label[640];
+        char display_result[96];
         MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[i].expression, -1, expr, (int)(sizeof(expr) / sizeof(expr[0])));
-        MultiByteToWideChar(CP_UTF8, 0, g_app.calculations[i].result, -1, result, (int)(sizeof(result) / sizeof(result[0])));
+        format_scientific_result(strtod(g_app.calculations[i].result, NULL), display_result, sizeof(display_result));
+        MultiByteToWideChar(CP_UTF8, 0, display_result, -1, result, (int)(sizeof(result) / sizeof(result[0])));
         _snwprintf(label, sizeof(label) / sizeof(label[0]), L"%ls = %ls", expr, result);
         label[(sizeof(label) / sizeof(label[0])) - 1] = L'\0';
         SendMessageW(g_app.scientific_history, LB_ADDSTRING, 0, (LPARAM)label);
@@ -601,10 +683,11 @@ static void update_status(void) {
     } else if (!g_app.scientific_mode && g_app.hover_valid) {
         MultiByteToWideChar(CP_UTF8, 0, g_app.hover_label, -1, text, (int)(sizeof(text) / sizeof(text[0])));
     } else {
-        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"%ls calculator    %ls angle    %ls theme%ls",
+        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"%ls calculator    %ls angle    %ls theme%ls%ls",
             g_app.scientific_mode ? L"Scientific" : L"Graphing",
             g_app.degrees ? L"DEG" : L"RAD",
             g_app.dark_mode ? L"Dark" : L"Light",
+            g_app.scientific_mode ? (g_app.scientific_fraction_output ? L"    Fraction output" : L"    Decimal output") : L"",
             g_app.scientific_mode ? L"" : L"    Pan: arrows    Zoom: + / -");
         text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
     }
@@ -614,30 +697,28 @@ static void update_status(void) {
 static void calculate_scientific_result(void) {
     char expr[512];
     char error[160] = {0};
-    char result_text[64] = {0};
-    wchar_t text[256];
+    char stored_result[64] = {0};
     read_input_expression(expr, sizeof(expr));
 
     double result = evaluate_expression(expr, 0.0, error, sizeof(error));
     if (error[0] != '\0' || !isfinite(result)) {
         if (error[0] == '\0') strcpy(error, "Result is undefined.");
+        wchar_t text[256];
         MultiByteToWideChar(CP_UTF8, 0, error, -1, text, (int)(sizeof(text) / sizeof(text[0])));
         g_app.has_error = true;
         strncpy(g_app.error, error, sizeof(g_app.error) - 1);
         g_app.error[sizeof(g_app.error) - 1] = '\0';
+        SetWindowTextW(g_app.scientific_result, text);
     } else {
         // %.17g is enough to round-trip a double for follow-up calculations.
-        snprintf(result_text, sizeof(result_text), "%.17g", result);
-        _snwprintf(text, sizeof(text) / sizeof(text[0]), L"= %.17g", result);
-        text[(sizeof(text) / sizeof(text[0])) - 1] = L'\0';
+        snprintf(stored_result, sizeof(stored_result), "%.17g", result);
         g_app.last_answer = result;
         g_app.has_answer = true;
         g_app.has_error = false;
         g_app.error[0] = '\0';
-        add_calculation_history(expr, result_text);
+        update_scientific_result_display();
+        add_calculation_history(expr, stored_result);
     }
-
-    SetWindowTextW(g_app.scientific_result, text);
     update_status();
 }
 
@@ -1282,6 +1363,8 @@ static void update_menu_checks(HWND hwnd) {
     CheckMenuItem(menu, MENU_DEG_ID, MF_BYCOMMAND | (g_app.degrees ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_LIGHT_ID, MF_BYCOMMAND | (!g_app.dark_mode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MENU_DARK_ID, MF_BYCOMMAND | (g_app.dark_mode ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, MENU_DECIMAL_OUTPUT_ID, MF_BYCOMMAND | (!g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, MENU_FRACTION_OUTPUT_ID, MF_BYCOMMAND | (g_app.scientific_fraction_output ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static HMENU create_app_menu(void) {
@@ -1292,6 +1375,9 @@ static HMENU create_app_menu(void) {
     AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
     AppendMenuW(settings, MF_STRING, MENU_LIGHT_ID, L"Light mode");
     AppendMenuW(settings, MF_STRING, MENU_DARK_ID, L"Dark mode");
+    AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(settings, MF_STRING, MENU_DECIMAL_OUTPUT_ID, L"Decimal output");
+    AppendMenuW(settings, MF_STRING, MENU_FRACTION_OUTPUT_ID, L"Fraction output");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, L"Settings");
     return menu;
 }
@@ -1330,7 +1416,7 @@ static void draw_scientific_workspace(HDC hdc, RECT client) {
     TextOutW(hdc, panel.left + 24, panel.top + 24, L"Scientific Calculator", 21);
     SetTextColor(hdc, c.muted);
     const wchar_t *help = L"Type an expression, decimal, fraction, or mixed number, then press Calculate or Enter.";
-    const wchar_t *functions = L"Supports ans, sin, cos, tan, asin, acos, atan, sqrt, log, ln, exp, abs, floor, ceil, pi, and e.";
+    const wchar_t *functions = L"Settings can show scientific results as decimals or fractions; ans keeps full precision.";
     TextOutW(hdc, panel.left + 24, panel.top + 56, help, lstrlenW(help));
     TextOutW(hdc, panel.left + 24, panel.top + 88, functions, lstrlenW(functions));
     SelectObject(hdc, old_font);
@@ -1351,6 +1437,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         g_app.degrees = false;
         g_app.dark_mode = false;
         g_app.scientific_mode = false;
+        g_app.scientific_fraction_output = false;
 
         SetMenu(hwnd, create_app_menu());
         update_menu_checks(hwnd);
@@ -1458,6 +1545,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             g_app.dark_mode = id == MENU_DARK_ID;
             rebuild_brushes();
             update_menu_checks(hwnd);
+            update_status();
+            InvalidateRect(hwnd, NULL, TRUE);
+        } else if (id == MENU_DECIMAL_OUTPUT_ID || id == MENU_FRACTION_OUTPUT_ID) {
+            g_app.scientific_fraction_output = id == MENU_FRACTION_OUTPUT_ID;
+            update_menu_checks(hwnd);
+            update_scientific_result_display();
+            refresh_calculation_history();
             update_status();
             InvalidateRect(hwnd, NULL, TRUE);
         }
